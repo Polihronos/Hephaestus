@@ -23,10 +23,11 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     at: new Date(startedAt).toISOString(), marker, success: false,
     checks: [], requests: [], screenshots: [], transport: [], stateTransitions: [],
     limitations: ['This verifies a short isolated desktop session, not human speech or all-day proactive behaviour.'],
-    faultInjections: [],
+    faultInjections: [], cancellationAttempts: [],
   };
   let phase = 'setup', previousStateKey = '', confirmationResult = null, injectedConfirmation = null;
   let observedClient = c.t3, transportEpoch = 0;
+  let cancellationTarget = null;
   const deltas = [], privacyViolations = [], toolEvents = [];
   let speechEvents = 0, flushEvents = 0, allowCleanup = false;
 
@@ -70,7 +71,34 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     if (key !== previousStateKey) { previousStateKey = key; report.stateTransitions.push(item); }
     if (item.watching || item.proactive || item.backgroundVision) privacyViolations.push(item.elapsedMs);
   };
-  const deltaListener = data => deltas.push({ at: Date.now(), runId: data.turnId, generation: data.generation, length: data.full?.length ?? 0 });
+  const deltaListener = data => {
+    // A final-only reply also emits delta. Capture the provider item's streaming
+    // flag now: the same map entry will become non-streaming when it completes.
+    const item = c.t3Seen?.get(data.itemId);
+    const delta = { at: Date.now(), itemId: data.itemId, runId: data.turnId, generation: data.generation,
+      length: data.full?.length ?? 0, streaming: item?.streaming === true, providerTurnId: item?.providerTurnId };
+    deltas.push(delta);
+    const target = cancellationTarget;
+    if (!target || target.startup || target.stopPromise || !target.approvalReady || !delta.streaming || !delta.length ||
+        target.t3MessageId !== c.t3MessageId || delta.runId !== c.t3RunId) return;
+    target.record.firstStreamingDelta = delta;
+    queueStop(target, { mode: 'streaming', runId: delta.runId, at: delta.at });
+  };
+  function queueStop(target, trigger) {
+    if (target.stopPromise) return;
+    target.record.trigger = trigger;
+    target.record.stopQueuedAt = Date.now();
+    target.stopTransitionStart = report.stateTransitions.length;
+    // Dispatch the production Stop click directly from the genuine streaming
+    // callback. No screenshot, projection call, or polling precedes the click.
+    target.stopPromise = ui(`(() => {
+      const stop=document.querySelector('#stop'),approvalVisible=!document.querySelector('#confirmation').hidden;
+      if(stop.disabled)return {clicked:false,approvalVisible,reason:'Stop was already disabled',at:Date.now()};
+      const at=Date.now();stop.click();return {clicked:true,approvalVisible,at};
+    })()`).then(result => { target.record.stopUI = result; return result; }, error => {
+      target.stopError = error; target.record.stopError = safeError(error); return null;
+    });
+  }
   const speechListener = () => { speechEvents++; };
   const flushListener = () => { flushEvents++; };
   const toolListener = event => { if (event.kind === 'tool' && event.status === 'running') toolEvents.push({ id: event.id, title: event.title, elapsedMs: Date.now() - startedAt }); };
@@ -94,12 +122,20 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
   function finalFor(runId) {
     return c.messages.filter(message => message.role === 'assistant' && message.turnId === runId && message.providerItemId).at(-1);
   }
-  async function sendFromUI(text, id) {
+  async function sendFromUI(text, id, { onAccepted, onRun } = {}) {
     assertPrivate();
     await until(() => c.state.connection === 'connected' && !c.state.busy && !c.t3InFlight && !c.state.sendPending,
       45000, 'The session was not idle before ' + id);
     await showDashboard('companion', true);
     const before = new Set(c.messages.map(message => message.id)), at = Date.now();
+    let acceptanceError, acceptanceSeen = false;
+    const acceptedListener = message => {
+      if (!onAccepted || acceptanceSeen || before.has(message.id) || message.role !== 'user' || message.text !== text || message.delivery !== 'sent') return;
+      acceptanceSeen = true;
+      try { onAccepted(message); } catch (error) { acceptanceError = error; }
+    };
+    if (onAccepted) c.on('messageUpdated', acceptedListener);
+    try {
     const pending = await ui(`(() => {
       const input = document.querySelector('#dashboard-input');
       input.value = ${JSON.stringify(text)};
@@ -114,7 +150,10 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
       'real-ui-model', { draftPreserved: pending.draft === text, disabled: pending.disabled, ariaBusy: pending.busy });
     const message = await until(() => c.messages.find(message => !before.has(message.id) && message.role === 'user' && message.text === text && message.delivery === 'sent' && message.t3MessageId),
       45000, 'The production send was not accepted by T3');
+    if (acceptanceError) throw acceptanceError;
+    if (onAccepted) assert.ok(acceptanceSeen, 'The real send acknowledgement was not observed before streaming');
     const run = await until(() => runFor(message), 15000, 'The accepted message did not acquire a real T3 run');
+    onRun?.(run);
     await until(() => ui('!document.querySelector("#dashboard-input").value && !window.hephaestusDashboardInspect().sendPending'),
       5000, 'The composer did not clear after real dispatch acceptance');
     const entry = { id, userMessageId: message.id, t3MessageId: message.t3MessageId, runId: run.id, acceptedMs: Date.now() - at };
@@ -123,6 +162,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
       c.messages.filter(item => item.t3MessageId === message.t3MessageId).length === 1,
       'real-ui-model', { t3MessageId: message.t3MessageId, runId: run.id });
     return { message, runId: run.id, entry };
+    } finally { if (onAccepted) c.off('messageUpdated', acceptedListener); }
   }
   async function completed(run, expectedMarker, timeout = 90000) {
     const answer = await until(() => {
@@ -267,32 +307,101 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     await snapshot('03-recovered-response.png');
 
     phase = 'runtime-cancellation';
-    const cancelToken = marker + '-CANCEL';
-    const stopping = await sendFromUI(`Text-only cancellation verification. Do not call tools or change anything. Start your answer with ${cancelToken}. Intentionally write a long answer: 160 numbered tips for keeping a desk tidy, each about ten words and each on its own paragraph. Continue the numbered list without compressing or summarizing it; the application will cancel this real response while it is generating.`, 'cancel-send');
-    await until(() => c.state.busy && deltas.some(delta => delta.runId === stopping.runId && delta.length > 0), 60000, 'The long real response never began streaming');
-    assert.equal(c.confirmation, null, 'A real approval was unexpectedly pending before fault injection');
-    report.faultInjections.push({ kind: 'pending-local-confirmation', runId: stopping.runId, description: 'Injected an explicitly labelled, action-free local approval while the real model was generating. Runtime cancellation itself is real.' });
-    injectedConfirmation = c.askConfirmation({ kind: 'verification', reason: 'Session verification fault injection: no desktop action will be performed.' })
-      .then(() => { confirmationResult = 'approved'; }, () => { confirmationResult = 'declined'; });
-    await until(() => ui('!document.querySelector("#confirmation").hidden'), 5000, 'The injected approval did not reach the production UI');
-    await snapshot('04-generating-before-stop.png');
-    const beforeStop = await projection(), runningBeforeStop = beforeStop.runs?.find(run => run.id === stopping.runId);
-    check('cancel-live-generation', 'The cancellation targets a real streaming model request',
-      !!runningBeforeStop && !terminal.has(runningBeforeStop.status) && deltas.some(delta => delta.runId === stopping.runId && delta.length > 0),
-      'real-transport-model', { runId: stopping.runId, remoteStatus: runningBeforeStop?.status });
-    const stopAt = Date.now(), stopTransitionStart = report.stateTransitions.length;
-    await ui('(() => {const stop=document.querySelector("#stop");if(stop.disabled)throw new Error("The production Stop button is disabled");stop.click();})()');
-    await until(() => !c.confirmation && confirmationResult === 'declined', 10000, 'Stopping the real run did not close the injected local approval');
-    await until(() => !c.state.busy && !c.state.stopping && !c.t3InFlight, 45000, 'The cancelled runtime did not return to an idle state');
-    const stoppedProjection = await projection(), stoppedRun = stoppedProjection.runs?.find(run => run.id === stopping.runId);
-    check('runtime-stop-confirmed', 'The real T3 runtime confirms cancellation after the production Stop action',
-      cancelled.has(stoppedRun?.status), 'real-transport-model', { runId: stopping.runId, status: stoppedRun?.status, confirmedMs: Date.now() - stopAt });
-    check('stopping-feedback', 'The app reports Stopping before confirmed cancellation',
-      report.stateTransitions.slice(stopTransitionStart).some(state => state.busy && state.stopping), 'real-ui-model');
-    check('approval-closed', 'Stop declines and hides the injected pending approval',
-      confirmationResult === 'declined' && c.confirmation === null && await ui('document.querySelector("#confirmation").hidden'),
-      'fault-injection-integration', { approval: 'injected; no desktop action', result: confirmationResult });
-    Object.assign(stopping.entry, { status: stoppedRun.status, cancelled: true });
+    let cancelledAttempt = null;
+    // A final-only answer cannot exercise live cancellation. Permit one more
+    // real request to test startup cancellation, labelled separately.
+    for (let attempt = 1; attempt <= 2 && !cancelledAttempt; attempt++) {
+      const cancelToken = marker + '-CANCEL-' + attempt;
+      const record = { attempt, marker: cancelToken, mode: attempt === 1 ? 'streaming' : 'startup', outcome: 'pending' };
+      report.cancellationAttempts.push(record);
+      const target = { record, startup: attempt === 2, approvalReady: false, stopPromise: null, t3MessageId: null };
+      cancellationTarget = target; confirmationResult = null;
+      const prompt = attempt === 1
+        ? `Write a substantial practical guide of about 1,600 words about setting up a calm, useful desktop workspace. Use twelve sections with several concrete paragraphs per section. Begin the first sentence with ${cancelToken} and immediately continue with useful advice, rather than putting the token on a separate line. Explain tradeoffs, maintenance habits, and specific examples. This is text only: do not use tools, inspect the computer, or change settings. Give the substantive guide itself without a preamble or a promise to continue.`
+        : `Write a detailed, practical guide to organizing an ordinary home office for focused work, with clear sections, tradeoffs, and concrete examples. Start the first sentence with ${cancelToken} and continue with the guide itself. This is text only: do not use tools, read files, inspect the desktop, or change any settings.`;
+      const stopping = await sendFromUI(prompt, attempt === 1 ? 'cancel-send' : 'cancel-retry-send', {
+        onAccepted(message) {
+          assert.equal(c.confirmation, null, 'A real approval was unexpectedly pending before fault injection');
+          target.t3MessageId = message.t3MessageId;
+          record.approvalReadyAt = Date.now();
+          report.faultInjections.push({ kind: 'pending-local-confirmation', attempt, t3MessageId: message.t3MessageId,
+            description: 'Injected an explicitly labelled, action-free approval synchronously on real send acceptance, before the first genuine streaming callback.' });
+          injectedConfirmation = c.askConfirmation({ kind: 'verification', reason: 'Session verification fault injection: no desktop action will be performed.' })
+            .then(() => { confirmationResult = 'approved'; }, () => { confirmationResult = 'declined'; });
+          target.approvalReady = true;
+        },
+        onRun(run) {
+          if (target.startup && !terminal.has(run.status) && c.state.busy && c.t3InFlight) {
+            queueStop(target, { mode: 'startup', runId: run.id, status: run.status, at: Date.now(), accepted: true });
+          }
+        },
+      });
+      record.runId = stopping.runId;
+      await until(() => target.stopPromise || (terminal.has(c.t3Runs.get(stopping.runId)?.status) && !c.state.busy && !c.t3InFlight),
+        60000, 'The substantive response neither streamed nor completed within the cancellation observation window');
+      if (target.stopPromise) {
+        await target.stopPromise;
+        if (target.stopError) throw target.stopError;
+        await until(() => !c.state.busy && !c.state.stopping && !c.t3InFlight, 45000, 'The runtime did not return to idle after Stop');
+      }
+      const stoppedProjection = await projection(), stoppedRun = stoppedProjection.runs?.find(run => run.id === stopping.runId);
+      assert.ok(stoppedRun, 'The cancellation attempt is absent from the real T3 projection');
+      const streamEvents = deltas.filter(delta => delta.runId === stopping.runId);
+      const actualStreams = streamEvents.filter(delta => delta.streaming && delta.length > 0);
+      const attempts = (stoppedProjection.attempts ?? []).filter(item => item.runId === stopping.runId);
+      const attemptIds = new Set(attempts.map(item => item.id));
+      const providerTurns = (stoppedProjection.providerTurns ?? []).filter(turn => attemptIds.has(turn.runAttemptId) || turn.id === record.firstStreamingDelta?.providerTurnId);
+      const interrupt = (stoppedProjection.turnItems ?? []).find(item => item.runId === stopping.runId && item.type === 'run_interrupt_request');
+      const interruptAt = Date.parse(interrupt?.startedAt ?? interrupt?.createdAt ?? interrupt?.completedAt);
+      const completedAt = Date.parse(stoppedRun.completedAt);
+      const naturalCompletion = stoppedRun.status === 'completed' && (!interrupt ||
+        (Number.isFinite(completedAt) && Number.isFinite(interruptAt) && completedAt <= interruptAt) ||
+        (!cancelled.has(stoppedRun.status) && providerTurns.length > 0 && providerTurns.every(turn => turn.status === 'completed' && Number.isFinite(Date.parse(turn.completedAt)) && Date.parse(turn.completedAt) <= interruptAt)));
+      Object.assign(record, { runStatus: stoppedRun.status, actualStreamingEvents: actualStreams.length,
+        finalOnlyDeltaEvents: streamEvents.filter(delta => !delta.streaming).length,
+        interruptRequestedAt: interrupt?.startedAt ?? null, runCompletedAt: stoppedRun.completedAt ?? null,
+        providerTurns: providerTurns.map(turn => ({ id: turn.id, status: turn.status, completedAt: turn.completedAt })) });
+      const exercised = target.startup ? record.trigger?.mode === 'startup' && record.trigger.accepted && !terminal.has(record.trigger.status) : actualStreams.length > 0;
+      const realCancellation = !!record.stopUI?.clicked && !!interrupt && exercised &&
+        !naturalCompletion && (cancelled.has(stoppedRun.status) || providerTurns.some(turn => cancelled.has(turn.status)));
+      if (!realCancellation && (naturalCompletion || (!actualStreams.length && stoppedRun.status === 'completed'))) {
+        record.outcome = 'not-exercised';
+        record.reason = !target.startup && !actualStreams.length ? 'The model delivered a final-only answer; no genuine streaming callback occurred.' : 'The runtime completed naturally before the Stop request could interrupt it.';
+        report.checks.push({ id: 'cancellation-attempt-' + attempt, name: target.startup ? 'Cancel a real request during startup' : 'Interrupt a genuinely streaming model response', status: 'not-exercised', kind: 'real-transport-model',
+          reason: record.reason, evidence: { runId: stopping.runId, runStatus: stoppedRun.status, actualStreamingEvents: actualStreams.length,
+            runCompletedAt: record.runCompletedAt, interruptRequestedAt: record.interruptRequestedAt } });
+        c.confirm(false); await injectedConfirmation;
+        record.approvalResult = 'declined by verifier cleanup; not evidence of Stop';
+        Object.assign(stopping.entry, { status: stoppedRun.status, cancelled: false, cancellationOutcome: 'not-exercised' });
+        cancellationTarget = null;
+        if (attempt === 1) continue;
+        break;
+      }
+      if (target.startup) {
+        check('cancel-startup-active', 'Stop targets an accepted real request before it completes', exercised,
+          'real-transport-model', { runId: stopping.runId, trigger: record.trigger, streamingEventsObserved: actualStreams.length });
+        report.limitations.push('Streaming cancellation was not exercised; real runtime cancellation was instead verified during request startup.');
+      } else {
+        check('cancel-live-generation', 'Stop targets a genuinely streaming provider item after approval setup',
+          actualStreams.length > 0 && !!record.firstStreamingDelta && record.approvalReadyAt <= record.firstStreamingDelta.at,
+          'real-transport-model', { runId: stopping.runId, firstStreamingDelta: record.firstStreamingDelta, approvalReadyAt: record.approvalReadyAt });
+      }
+      check('runtime-stop-confirmed', 'The real runtime confirms cancellation after the production Stop action',
+        realCancellation, 'real-transport-model', { runId: stopping.runId, runStatus: stoppedRun.status,
+          providerStatuses: providerTurns.map(turn => turn.status), interruptRequestedAt: record.interruptRequestedAt,
+          confirmedMs: Date.now() - record.stopQueuedAt });
+      await until(() => !c.confirmation && confirmationResult === 'declined', 10000, 'Stopping the real run did not close the injected local approval');
+      check('stopping-feedback', 'The app reports Stopping before confirmed cancellation',
+        report.stateTransitions.slice(target.stopTransitionStart).some(state => state.busy && state.stopping), 'real-ui-model');
+      check('approval-closed', 'Stop declines and hides the injected pending approval',
+        record.stopUI.approvalVisible && confirmationResult === 'declined' && c.confirmation === null && await ui('document.querySelector("#confirmation").hidden'),
+        'fault-injection-integration', { approval: 'injected on real acceptance; no desktop action', result: confirmationResult });
+      record.outcome = 'cancelled'; record.approvalResult = confirmationResult;
+      Object.assign(stopping.entry, { status: stoppedRun.status, cancelled: true });
+      cancelledAttempt = record; cancellationTarget = null;
+    }
+    check('genuine-cancellation-required', 'At least one real model request was cancelled', !!cancelledAttempt,
+      'real-transport-model', { attempts: report.cancellationAttempts.length, outcomes: report.cancellationAttempts.map(attempt => attempt.outcome) });
     await snapshot('05-confirmed-stop.png');
 
     phase = 'post-cancellation-request';
@@ -311,6 +420,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     report.failure = { phase, message: safeError(error) };
     console.error('SESSION_CHECK failed during ' + phase + ': ' + safeError(error));
   } finally {
+    cancellationTarget = null;
     if (allowCleanup) {
       try {
         c.confirm(false);
