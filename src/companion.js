@@ -8,6 +8,9 @@ import { ProcessRpc } from './process-rpc.js';
 import { screenDifference, coordinates, validateAction, fastCommand } from './commands.js';
 import { validateAnnotation, framePoint } from './annotations.js';
 import {TokenLedger} from './token-ledger.js';
+import {PrivacyBlockedError,excludedApps,excludedProcess} from './privacy.js';
+import {evaluateNotice,NOTICE_COOLDOWN} from './notice-policy.js';
+export {PrivacyBlockedError} from './privacy.js';
 
 export const dynamicTools=[
  {type:'function',name:'screen_observe',description:'Get a fresh screenshot and observationId. Choose monitor to see the desktop, Start menu, or multiple apps; window gives the active app clearly.',inputSchema:{type:'object',properties:{mode:{type:'string',enum:['window','monitor']},monitor:{type:'integer'}},additionalProperties:false}},
@@ -18,14 +21,19 @@ dynamicTools.push(
  {type:'function',name:'screen_zoom',description:'Read a small area clearly at native resolution. Region coordinates are pixels in a previous observation.',inputSchema:{type:'object',properties:{observationId:{type:'string'},x:{type:'number'},y:{type:'number'},width:{type:'number'},height:{type:'number'}},required:['observationId','x','y','width','height'],additionalProperties:false}},
  {type:'function',name:'screen_windows',description:'List visible applications and their window IDs.',inputSchema:{type:'object',properties:{},additionalProperties:false}},
  {type:'function',name:'screen_action',description:'Control an app on a user request. Every action returns a fresh observation; reuse it instead of observing again. For a stable input, sequence can click, type and press Enter in one call (at most six steps on the same window). Set focusTarget=true to bring that observed window forward immediately before input; changed content returns a fresh observation instead.',inputSchema:{type:'object',properties:{kind:{type:'string',enum:['click','doubleclick','rightclick','scroll','key','type','focus','browser','sequence']},observationId:{type:'string'},x:{type:'number'},y:{type:'number'},key:{type:'string'},text:{type:'string'},query:{type:'string'},delta:{type:'integer'},focusTarget:{type:'boolean'},needsConfirmation:{type:'boolean'},reason:{type:'string'},steps:{type:'array',maxItems:6,items:{type:'object',properties:{kind:{type:'string',enum:['click','doubleclick','rightclick','scroll','key','type']},x:{type:'number'},y:{type:'number'},key:{type:'string'},text:{type:'string'},delta:{type:'integer'}},required:['kind'],additionalProperties:false}}},required:['kind','observationId'],additionalProperties:false}},
- {type:'function',name:'companion_notice',description:'Show a useful, specific spontaneous insight as a small popup. Speech follows the user setting. Paused, duplicate or cooling-down notices return a normal suppressed result; do not retry.',inputSchema:{type:'object',properties:{text:{type:'string'}},required:['text'],additionalProperties:false}}
+ {type:'function',name:'companion_notice',description:'Show a concrete problem or opportunity that advances the current user task. Include fresh visible evidence, a specific next action, why it matters and the benefit. Status narration is suppressed. A suppressed result is normal: do not retry or rephrase.',inputSchema:{type:'object',properties:{text:{type:'string'},kind:{type:'string',enum:['problem','opportunity']},subject:{type:'string',description:'Stable specific subject, such as migration P2022 User.timezone; retain it across paraphrases.'},task:{type:'string',description:'The current task this directly advances, from the conversation or fresh visible work.'},taskSource:{type:'string',enum:['conversation','screen'],description:'Use screen for an independently observed task; evidence must identify that task.'},evidence:{type:'string',description:'Concrete visible evidence, including relevant identifiers or exact values.'},action:{type:'string',description:'A specific useful next action the user can take.'},rationale:{type:'string',description:'Why this matters to the current user task now.'},benefit:{type:'string',description:'The concrete outcome or avoided cost.'},observationId:{type:'string'}},required:['text','kind','subject','task','taskSource','evidence','action','rationale','benefit'],additionalProperties:false}}
 );
-const settingsKeys=['model','effort','watching','backgroundVision','spokenReplies','monitor','prompt','opacity','autoSend','voice','mascotPosition','inputMode','inputDevice','control','proactive','captureMode','backgroundInterval'];
+const settingsKeys=['model','effort','watching','backgroundVision','spokenReplies','monitor','prompt','opacity','autoSend','voice','mascotPosition','inputMode','inputDevice','control','proactive','captureMode','backgroundInterval','excludedApps','noticeSnoozeUntil','noticeFeedback'];
 export class Companion extends EventEmitter{
- constructor({root,dataDir,excludePids=[],openBrowser}){super();Object.assign(this,{root,dataDir,excludePids,openBrowser});this.state={name:'Hephaestus',connection:'connecting',plan:null,model:'gpt-6-luna',effort:'low',running:true,watching:true,backgroundVision:true,spokenReplies:false,monitor:-1,busy:false,activity:'Connecting',inputMode:'wispr',inputDevice:'default',control:true,proactive:true,captureMode:'window',backgroundInterval:20000,opacity:1,autoSend:true,voice:'',prompt:'',speech:'off',listening:false,usage:null,error:null};this.frames=[];this.observations=new Map();this.messages=[];this.activities=[];this.generation=0;this.closed=false;this.lastWatchAt=Date.now();this.spokenHistory=[];}
+ constructor({root,dataDir,excludePids=[],openBrowser}){super();Object.assign(this,{root,dataDir,excludePids,openBrowser});this.state={name:'Hephaestus',connection:'connecting',plan:null,model:'gpt-6-luna',effort:'low',running:true,watching:true,backgroundVision:true,spokenReplies:false,monitor:-1,busy:false,activity:'Connecting',inputMode:'wispr',inputDevice:'default',control:true,proactive:true,captureMode:'window',backgroundInterval:20000,opacity:1,autoSend:true,voice:'',prompt:'',speech:'off',listening:false,usage:null,error:null,excludedApps:[],noticeSnoozeUntil:0,noticeFeedback:[],screenPrivacyBlocked:false,screenPrivacyReason:null};this.frames=[];this.observations=new Map();this.messages=[];this.activities=[];this.generation=0;this.closed=false;this.lastWatchAt=Date.now();this.spokenHistory=[];}
  publish(extra={}){Object.assign(this.state,extra);this.emit('state',{...this.state});}
  message(role,text,extra={}){const m={id:randomUUID(),role,text,at:Date.now(),...extra};this.messages.push(m);this.messages=this.messages.slice(-120);this.emit('message',m);if(this.threadId)this.save().catch(()=>{});return m;}
  async start(){await mkdir(this.dataDir,{recursive:true});this.defaultPrompt=await readFile(join(this.root,'assets','system-prompt.txt'),'utf8');let s={};try{s=JSON.parse(await readFile(join(this.dataDir,'settings.json'),'utf8'));}catch{}for(const k of settingsKeys)if(s[k]!==undefined)this.state[k]=s[k];if(!s.defaultsRevision){this.state.inputMode='wispr';this.state.spokenReplies=false;}if(!s.lunaRevision){this.state.model='gpt-6-luna';this.state.effort='low';}if(!this.state.prompt||(s.promptVersion<4&&this.state.prompt.startsWith('You are my spoken screen companion.')))this.state.prompt=this.defaultPrompt;this.messages=(s.messages??[]).filter(m=>m&&typeof m.text==='string').slice(-120);for(const m of this.messages)this.emit('message',m);this.savedThread=s.promptVersion===4&&s.performanceRevision===2?s.threadId:null;
+  try{this.state.excludedApps=excludedApps(this.state.excludedApps);}catch{this.privacyConfigurationError='Saved app exclusions are invalid; save valid private apps in Settings before sharing your screen';this.state.excludedApps=[];}
+  this.state.noticeFeedback=Array.isArray(this.state.noticeFeedback)?this.state.noticeFeedback.filter(f=>f&&['useful','dismiss'].includes(f.value)&&typeof f.text==='string'&&Number.isFinite(f.at)).slice(-150):[];
+  this.state.noticeSnoozeUntil=Number.isFinite(this.state.noticeSnoozeUntil)?Math.max(0,this.state.noticeSnoozeUntil):0;
+  this.state.backgroundInterval=Math.max(10000,Math.min(600000,Number(this.state.backgroundInterval)||20000));
+  this.lastNoticeAt=this.messages.filter(m=>m.source==='noticed').at(-1)?.at??0;
   this.ledger=new TokenLedger(this.dataDir);this.publish({tokens:await this.ledger.load()});this.historyImport=this.ledger.importHistory(join(homedir(),'.codex')).then(tokens=>this.publish({tokens})).catch(e=>this.publish({tokenImportError:e.message}));
   await this.startBridge();if(this.state.inputMode==='always')this.startSpeech().catch(e=>this.publish({speech:'error',error:e.message}));try{await this.connect();}catch(e){this.publish({error:e.message});this.scheduleReconnect();}this.screenTimer=setInterval(()=>this.sample().catch(e=>this.publish({screenError:e.message})),750);this.visionTimer=setInterval(()=>this.watch().catch(()=>{}),1000);this.usageTimer=setInterval(()=>this.updateUsage().catch(()=>{}),60000);await this.sample();return this.state;}
  activityEvent(event){const index=this.activities.findIndex(e=>e.id===event.id);const item={at:Date.now(),...event};if(index>=0)this.activities[index]={...this.activities[index],...item};else this.activities.push(item);this.activities=this.activities.slice(-150);this.emit('activity',item);}
@@ -81,24 +89,93 @@ export class Companion extends EventEmitter{
  }
  async save(){const s={promptVersion:4,defaultsRevision:1,performanceRevision:2,lunaRevision:1,threadId:this.threadId,messages:this.messages};for(const k of settingsKeys)s[k]=this.state[k];this.saveQueue=(this.saveQueue??Promise.resolve()).catch(()=>{}).then(async()=>{const tmp=join(this.dataDir,'settings.tmp');await writeFile(tmp,JSON.stringify(s,null,2));await rename(tmp,join(this.dataDir,'settings.json'));});return this.saveQueue;}
  async updateUsage(){if(this.state.connection!=='connected')return;const r=await this.rpc.call('account/rateLimits/read',{});this.publish({usage:r.rateLimits});}
- async sample(){if(this.sampling||!this.state.running||!this.state.watching)return;this.sampling=true;try{const f=await this.bridge.call('capture',{monitor:this.state.monitor,mode:this.state.captureMode,maxWidth:2560});if(!this.state.running||!this.state.watching)return;f.id=randomUUID();this.latest=f;this.frames=[f];this.publish({screenWindow:f.window.title,screenError:null,captureSource:f.captureSource});this.emit('frame',f);}finally{this.sampling=false;}}
- async observe(region,options={}){if(!this.state.running||!this.state.watching)throw new Error('Screen sharing is paused');const f=await this.bridge.call('capture',{monitor:options.monitor??this.state.monitor,mode:options.mode??this.state.captureMode,maxWidth:options.maxWidth??2560,...(region?{region}:{})});if(!this.state.running||!this.state.watching)throw new Error('Screen sharing was paused');f.id=randomUUID();this.latest=f;this.observations.set(f.id,f);if(this.observations.size>20)this.observations.delete(this.observations.keys().next().value);this.publish({lastVisionAt:Date.now()});this.emit('visionFrame',f);return f;}
+ clearScreen(){this.frames=[];this.observations.clear();this.latest=null;this.attention=null;this.attentionPhysical=null;this.lastWatchFingerprint=null;this.emit('frame',null);this.emit('visionFrame',null);this.emit('annotation',{mark:{kind:'clear'}});}
+ blockScreen(reason){this.clearScreen();this.publish({screenPrivacyBlocked:true,screenPrivacyReason:reason,screenWindow:null,captureSource:null,lastVisionAt:null});throw new PrivacyBlockedError(reason);}
+ async assertScreenAllowed({mode='window',frame}={}){
+  if(this.privacyConfigurationError)this.blockScreen(this.privacyConfigurationError);
+  let target;try{target=await this.bridge.call('target-info');}catch(e){if(this.state.excludedApps?.length)this.blockScreen('Cannot verify the active app; screen capture is blocked');else throw e;}
+  const apps=this.state.excludedApps??[];
+  const excluded=excludedProcess(target,apps)||excludedProcess(frame?.window,apps);
+  if(excluded)this.blockScreen(`Screen capture is blocked for ${excluded}.exe`);
+  if(apps.length&&(mode==='monitor'||frame?.captureSource?.startsWith('monitor'))){
+   let windows;try{windows=await this.bridge.call('windows');}catch{this.blockScreen('Cannot verify visible apps; monitor capture is blocked');}
+   const visible=windows.find(w=>excludedProcess(w,this.state.excludedApps));if(visible)this.blockScreen(`Monitor capture is blocked while ${excludedProcess(visible,this.state.excludedApps)}.exe has an open window`);
+  }
+  if(apps.length&&(!target?.process||!target?.id))this.blockScreen('Cannot identify the active app; screen capture is blocked');
+  if(this.state.screenPrivacyBlocked)this.publish({screenPrivacyBlocked:false,screenPrivacyReason:null});
+  return target;
+ }
+ async captureSafely(region,options={}){
+  if(!this.state.running||!this.state.watching)throw new Error('Screen sharing is paused');
+  const generation=this.generation,mode=options.mode??this.state.captureMode;
+  await this.assertScreenAllowed({mode});
+  if(generation!==this.generation||!this.state.running||!this.state.watching)throw new Error('Screen capture was interrupted');
+  const f=await this.bridge.call('capture',{monitor:options.monitor??this.state.monitor,mode,maxWidth:options.maxWidth??2560,...(region?{region}:{})});
+  await this.assertScreenAllowed({mode,frame:f});
+  if(generation!==this.generation||!this.state.running||!this.state.watching)throw new Error('Screen capture was interrupted');
+  f.id=randomUUID();return f;
+ }
+ async sample(){if(this.sampling||!this.state.running||!this.state.watching)return;this.sampling=true;try{const f=await this.captureSafely();this.latest=f;this.frames=[f];this.publish({screenWindow:f.window.title,screenError:null,captureSource:f.captureSource});this.emit('frame',f);}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED'&&e.message!=='Screen capture was interrupted')throw e;}finally{this.sampling=false;}}
+ async observe(region,options={}){const f=await this.captureSafely(region,options);this.latest=f;this.observations.set(f.id,f);if(this.observations.size>20)this.observations.delete(this.observations.keys().next().value);this.publish({lastVisionAt:Date.now()});this.emit('visionFrame',f);return f;}
+ async safeObservation(region,options={}){return this.observe(region,options);}
  metadata(f){const p=this.attentionPhysical;const attention=p?{x:Math.round((p.x-f.bounds.x)*f.width/f.bounds.width),y:Math.round((p.y-f.bounds.y)*f.height/f.bounds.height),label:p.label}:this.attention??null;return {observationId:f.id,capturedAt:f.capturedAt,image:{width:f.width,height:f.height},pointer:f.cursor,window:f.window,attention};}
  frameContent(f){return [{type:'inputText',text:JSON.stringify(this.metadata(f))},{type:'inputImage',imageUrl:'data:image/jpeg;base64,'+f.image}];}
  observationContext(){const user=this.messages.filter(m=>m.role==='user').at(-1),reply=this.messages.filter(m=>m.role==='assistant'&&m.source!=='noticed').at(-1);return{lastUserMessage:user?{at:user.at,text:user.text.slice(0,1600)}:null,lastAssistantReply:reply?{at:reply.at,text:reply.text.slice(0,1600)}:null};}
- async watch(){if(!this.state.running||!this.state.watching||!this.state.backgroundVision||!this.state.proactive||this.state.busy||this.userRequests||this.transcribing||this.state.dictating||this.state.connection!=='connected'||Date.now()-this.lastWatchAt<this.state.backgroundInterval||Date.now()-(this.lastNoticeAt??0)<60000||!this.latest)return;const fp=Buffer.from(this.latest.fingerprint,'base64');if(screenDifference(fp,this.lastWatchFingerprint)<5)return;this.lastWatchAt=Date.now();this.lastWatchFingerprint=fp;await this.turn(JSON.stringify({event:'screen_update',proactive:true,context:this.observationContext(),recentNotices:this.messages.filter(m=>m.source==='noticed').slice(-4).map(m=>({at:m.at,text:m.text}))}),{background:true});}
- async submit(text,{source='text'}={}){
-  text=String(text).trim().slice(0,16000);if(!text)return;if(!this.state.running)await this.configure({running:true});this.userRequests=(this.userRequests??0)+1;
-  try{this.message('user',text,{source});await this.interrupt();const detected=fastCommand(text),fast=this.state.runtime==='t3'&&!['stop','mute'].includes(detected?.kind)?null:detected;if(fast?.kind==='stop')return;if(fast?.kind==='mute'){await this.configure({inputMode:'wispr'});return;}
-   if(fast&&this.state.control){const id='local-'+randomUUID(),started=Date.now();this.activityEvent({id,kind:'tool',title:'screen_action',text:fast.label,status:'running'});
-    try{if(fast.browser||fast.kind==='browser')await this.focusBrowser();if(fast.kind!=='browser'){const f=await this.observe();const a={...fast,windowId:f.window.id};if(fast.atCursor)Object.assign(a,coordinates(f,f.cursor.x,f.cursor.y));await this.bridge.call('action',a);}await this.observe();this.activityEvent({id,kind:'tool',title:'screen_action',status:'completed',durationMs:Date.now()-started});this.message('assistant',fast.label+'.');this.emit('speak',fast.label+'.');this.publish({lastReplyMs:Date.now()-started});return;}
-    catch(e){this.activityEvent({id,kind:'tool',title:'screen_action',status:'failed',text:e.message});throw e;}
-   }
-   await this.turn(text);
-  }finally{this.userRequests--;}
+ async watch(){
+  const now=Date.now(),context=this.observationContext();
+  if(this.watchPending||!this.state.running||!this.state.watching||!this.state.backgroundVision||!this.state.proactive||this.state.noticeSnoozeUntil>now||this.state.busy||this.userRequests||this.transcribing||this.state.dictating||this.state.connection!=='connected'||now-this.lastWatchAt<this.state.backgroundInterval||now-(this.lastNoticeAt??0)<NOTICE_COOLDOWN||!this.latest)return;
+  const fp=Buffer.from(this.latest.fingerprint,'base64');if(screenDifference(fp,this.lastWatchFingerprint)<5)return;
+  const generation=this.generation;this.watchPending=true;
+  try{
+   await this.assertScreenAllowed({mode:this.state.captureMode,frame:this.latest});
+   if(generation!==this.generation||!this.state.running||!this.state.watching||!this.state.backgroundVision||this.state.connection!=='connected'||this.state.busy||this.userRequests||!this.state.proactive||this.state.noticeSnoozeUntil>Date.now())return;
+   this.lastWatchAt=Date.now();this.lastWatchFingerprint=fp;
+   await this.turn(JSON.stringify({event:'screen_update',proactive:true,context,recentNotices:this.messages.filter(m=>m.source==='noticed').slice(-8).map(m=>({at:m.at,text:m.text,subject:m.notice?.subject})),noticeFeedback:this.state.noticeFeedback.slice(-12).map(f=>({subject:f.subject,value:f.value}))}),{background:true});
+  }catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED')throw e;}finally{this.watchPending=false;}
  }
- async focusBrowser(){const ws=await this.bridge.call('windows');const w=ws.find(w=>/^(chrome|msedge|firefox|brave|vivaldi|opera)$/i.test(w.process));if(w)return this.bridge.call('action',{kind:'focus',query:w.id});if(this.openBrowser)return this.openBrowser();throw new Error('Open your browser first');}
- async turn(text,{background=false}={}){
+ assertModelAvailable(){if(this.state.connection!=='connected')throw new Error('Codex is reconnecting. Your input remains available to retry.');if(this.state.stopping||this.desktopActionsRevoked&&this.t3InFlight)throw new Error('The previous request has not stopped yet. Your message has not been sent.');if([this.state.usage?.primary,this.state.usage?.secondary].some(w=>w?.usedPercent>=100))throw new Error('Your included Codex allowance is used up. Wait for its reset.');}
+ async submit(text,{source='text',onAccepted}={}){
+  text=String(text).trim().slice(0,16000);if(!text)return;
+  const fast=fastCommand(text),request=this.submitSequence=(this.submitSequence??0)+1;
+  if(!fast)this.assertModelAvailable();
+  if(fast&&!['stop','mute'].includes(fast.kind)){if(this.state.stopping||this.desktopActionsRevoked&&this.t3InFlight)throw new Error('The previous request has not stopped yet. Focus the Workspace to check its status');if(!this.state.control)throw new Error('App control is turned off');if(!this.state.running||!this.state.watching)throw new Error('Screen sharing is paused; resume it before controlling an app');}
+  if(!this.state.running&&!['stop','mute'].includes(fast?.kind))await this.configure({running:true});
+  this.userRequests=(this.userRequests??0)+1;let accepted=false,message;
+  const accept=()=>{if(accepted)return;accepted=true;if(message){message.delivery='sent';this.emit('messageUpdated',{...message});}onAccepted?.();};
+  try{
+   message=this.message('user',text,{source,delivery:'pending',...(fast?{localCommand:true}:{})});const interrupted=await this.interrupt(),token=this.generation;
+   const current=()=>{if(request!==this.submitSequence||token!==this.generation||this.closed)throw new Error('Request interrupted');};current();
+   if(fast?.kind==='stop'){this.message('assistant',interrupted?.confirmed===false?'Stopping the request.':'Stopped.',{source:'local'});accept();return;}
+   if(fast?.kind==='mute'){await this.configure({inputMode:'wispr'});current();this.message('assistant','Microphone paused.',{source:'local'});accept();return;}
+   if(fast){
+    const id='local-'+randomUUID(),started=Date.now(),guard=()=>{current();if(interrupted?.confirmed===false||this.state.stopping||this.desktopActionsRevoked&&this.t3InFlight)throw new Error('The previous request has not stopped yet; no app input was sent');if(!this.state.running||!this.state.watching)throw new Error('Screen sharing is paused');if(!this.state.control)throw new Error('App control is turned off');};
+    this.activityEvent({id,kind:'tool',title:'screen_action',text:fast.label,status:'running'});
+    try{
+     guard();let target=await this.assertScreenAllowed();guard();
+     if(fast.browser||fast.kind==='browser'){target=await this.focusBrowser({guard,allowOpen:fast.kind==='browser'});guard();}
+     if(fast.kind!=='browser'){
+      let action={kind:fast.kind,key:fast.key,delta:fast.delta,windowId:target?.id};
+      if(fast.atCursor){const f=await this.observe();guard();if(f.window.id!==target?.id)throw new Error('The target changed; no input was sent');Object.assign(action,coordinates(f,f.cursor.x,f.cursor.y));}
+      const verified=await this.assertScreenAllowed();guard();if(!target?.id||verified.id!==target.id)throw new Error('The target changed; no input was sent');
+      await this.bridge.call('action',action);guard();
+     }
+     this.activityEvent({id,kind:'tool',title:'screen_action',status:'completed',durationMs:Date.now()-started});this.message('assistant',fast.label+'.',{source:'local'});if(this.state.spokenReplies)this.emit('speak',fast.label+'.');this.publish({lastReplyMs:Date.now()-started});accept();return;
+    }catch(e){this.activityEvent({id,kind:'tool',title:'screen_action',status:'failed',text:e.message});throw e;}
+   }
+   current();await this.turn(text,{onAccepted:accept});if(!accepted)throw new Error('Request interrupted before dispatch');
+  }catch(e){if(message&&!accepted){message.delivery='failed';message.deliveryError=e.message;this.emit('messageUpdated',{...message});this.save().catch(()=>{});}throw e;}
+  finally{this.userRequests--;}
+ }
+ async focusBrowser({guard=()=>{},allowOpen=true}={}){
+  const browser=w=>/^(chrome|msedge|firefox|brave|vivaldi|opera)(\.exe)?$/i.test(w?.process??'');
+  const active=await this.assertScreenAllowed();guard();if(browser(active))return active;
+  const ws=await this.bridge.call('windows');guard();const choices=ws.filter(w=>browser(w)&&!excludedProcess(w,this.state.excludedApps));
+  if(choices.length>1)throw new Error('Several browser windows are open. Focus the browser you want, then try again');
+  if(choices.length===1){const w=choices[0];await this.assertScreenAllowed();guard();await this.bridge.call('action',{kind:'focus',query:w.id});guard();const focused=await this.assertScreenAllowed();guard();if(focused.id!==w.id)throw new Error('The requested browser could not be focused');return focused;}
+  if(allowOpen&&this.openBrowser&&!this.state.excludedApps.length){guard();await this.openBrowser();guard();return null;}
+  throw new Error('Open and focus your browser first');
+ }
+ async turn(text,{background=false,onAccepted}={}){
   if(this.state.connection!=='connected')throw new Error('Codex is reconnecting. Your input remains available to retry.');if([this.state.usage?.primary,this.state.usage?.secondary].some(w=>w?.usedPercent>=100)){this.publish({backgroundVision:false});throw new Error('Your included Codex allowance is used up. Wait for its reset.');}
   const turnModel=background?'gpt-6-luna':this.state.model,turnEffort=background?'low':this.state.effort;const token=++this.generation;this.background=background;this.actionCount=0;this.lastActionError=null;this.agentItems=new Map();this.turnId=null;this.turnStart=Date.now();this.firstReply=false;this.activeThreadId=this.threadId;
   this.publish({busy:true,background,activity:background?'Refreshing screen context':'Thinking'});if(!background)this.emit('responseStart',{generation:token});
@@ -106,13 +183,13 @@ export class Companion extends EventEmitter{
   try{
    if(background){const r=await this.rpc.call('thread/start',{...this.threadParams(),model:turnModel,ephemeral:true},30000);threadId=r.thread.id;if(token!==this.generation)return;this.activeThreadId=threadId;}
    const captureStart=Date.now();
-   if(this.state.watching){let f=background?null:this.latest;const target=f&&Date.now()-f.capturedAt<=1000?await this.bridge.call('target-info'):null;if(!f||!target||target.id!==f.window.id)f=await this.observe(null,{maxWidth:background?1600:2560});else{this.observations.set(f.id,f);this.publish({lastVisionAt:Date.now()});this.emit('visionFrame',f);}input.push({type:'text',text:JSON.stringify({event:'screen_observation',...this.metadata(f)})},{type:'image',url:'data:image/jpeg;base64,'+f.image});}
+   if(this.state.watching){try{const f=await this.observe(null,{maxWidth:background?1600:2560});input.push({type:'text',text:JSON.stringify({event:'screen_observation',...this.metadata(f)})},{type:'image',url:'data:image/jpeg;base64,'+f.image});}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED')throw e;if(background)return;input.push({type:'text',text:JSON.stringify({event:'screen_privacy',blocked:true,reason:e.message,scope:'Hephaestus screen sharing only; continue with this text request'})});}}
    if(token!==this.generation)return;this.publish({captureMs:Date.now()-captureStart});
    this.ledger?.setContext(threadId,{model:turnModel,purpose:this.dataDir.includes('verification')?'verification':background?'screen refresh':'conversation',request:background?text:this.messages.filter(m=>m.role==='user').at(-1)?.text??text,source:'live',startedAt:this.turnStart});
    const pending=this.rpc.call('turn/start',{threadId,input,model:turnModel,effort:turnEffort,summary:'auto',serviceTierForTurn:'default'},60000);this.starting=pending;const r=await pending;if(this.starting===pending)this.starting=null;
-   if(token!==this.generation){this.ignoredTurns??=new Set();this.ignoredTurns.add(r.turn.id);await this.rpc.call('turn/interrupt',{threadId,turnId:r.turn.id}).catch(()=>{});return;}this.turnId=r.turn.id;
+   if(token!==this.generation){this.ignoredTurns??=new Set();this.ignoredTurns.add(r.turn.id);await this.rpc.call('turn/interrupt',{threadId,turnId:r.turn.id}).catch(()=>{});throw new Error('Request interrupted');}this.turnId=r.turn.id;onAccepted?.();
    const timeout=setTimeout(()=>{if(token===this.generation){this.interrupt().catch(()=>{});this.publish({error:'The response timed out. Please try again.'});}finish();},90000);await completed;clearTimeout(timeout);
-  }catch(e){if(token===this.generation){this.message('system',e.message);this.publish({error:e.message});}}
+  }catch(e){if(token===this.generation){this.message('system',e.message);this.publish({error:e.message});}throw e;}
   finally{if(background&&threadId!==this.threadId)this.rpc.call('thread/unsubscribe',{threadId}).catch(()=>{});if(token===this.generation){this.turnId=null;this.finishTurn=null;this.publish({busy:false,background:false,lastTotalMs:Date.now()-this.turnStart,activity:'Ready'});}}
  }
  onNotification(m){
@@ -127,7 +204,7 @@ export class Companion extends EventEmitter{
    if(!this.firstReply){this.firstReply=true;this.publish({lastReplyMs:Date.now()-this.turnStart});}
    this.agentItems??=new Map();const full=(this.agentItems.get(p.itemId)??'')+p.delta;this.agentItems.set(p.itemId,full);this.emit('delta',{itemId:p.itemId,turnId:p.turnId,generation:this.generation,text:p.delta,full});
   }
-  if(m.method==='item/completed'&&p.item?.type==='agentMessage'&&!this.background&&p.item.text){this.message('assistant',p.item.text,{providerItemId:p.item.id,turnId:p.turnId,toolWarning:this.lastActionError??null});this.emit('speechFlush');}
+  if(m.method==='item/completed'&&p.item?.type==='agentMessage'&&!this.background&&p.item.text){const previous=this.agentItems?.get(p.item.id)??'';if(previous!==p.item.text){this.emit('delta',{itemId:p.item.id,turnId:p.turnId,generation:this.generation,full:p.item.text,text:p.item.text.startsWith(previous)?p.item.text.slice(previous.length):p.item.text});this.agentItems??=new Map();this.agentItems.set(p.item.id,p.item.text);}this.message('assistant',p.item.text,{providerItemId:p.item.id,turnId:p.turnId,toolWarning:this.lastActionError??null});this.emit('speechFlush');}
   if(m.method==='error')this.publish({error:p.error?.message??'Codex reported an error'});
   if(m.method==='turn/completed'){for(const e of [...this.activities])if(e.status==='running'&&e.kind==='reasoning')this.activityEvent({...e,status:'completed'});this.finishTurn?.();}
  }
@@ -141,16 +218,18 @@ export class Companion extends EventEmitter{
    const tool=m.params.tool,a=typeof m.params.arguments==='string'?JSON.parse(m.params.arguments):m.params.arguments??{};
    this.activityEvent({id:activityId,kind:'tool',title:tool,status:'running',text:a.reason??'',background:this.background});
    if(tool==='screen_observe'){const f=await this.observe(null,a);if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(f));return;}
-   if(tool==='screen_windows'){reply(JSON.stringify(await this.bridge.call('windows')));return;}
+   if(tool==='screen_windows'){const windows=await this.bridge.call('windows');if(token!==this.generation)throw new Error('Interrupted');reply(JSON.stringify(windows.filter(w=>!excludedProcess(w,this.state.excludedApps))));return;}
    if(tool==='companion_notice'){
     const text=String(a.text??'').trim().slice(0,1500);if(!text)throw new Error('Enter a notice');
-    const recent=this.messages.filter(m=>m.source==='noticed'&&Date.now()-m.at<600000),normalize=s=>s.toLowerCase().replace(/[^\p{L}\p{N}]/gu,'');
-    const reason=!this.state.proactive&&this.background?'paused':this.background&&Date.now()-(this.lastNoticeAt??0)<60000?'cooldown':recent.some(m=>normalize(m.text)===normalize(text))?'duplicate':null;
-    if(reason){reply(JSON.stringify({status:'suppressed',reason,retry:false}));return;}
-    this.lastNoticeAt=Date.now();this.message('assistant',text,{source:'noticed'});if(this.state.spokenReplies)this.emit('speak',text);reply(JSON.stringify({status:'shown'}));return;
+    const notice={...a,text},evaluate=()=>evaluateNotice({notice,context:this.observationContext(),recentNotices:this.messages.filter(m=>m.source==='noticed'),feedback:this.state.noticeFeedback,enabled:!this.background||this.state.proactive,snoozeUntil:this.background?this.state.noticeSnoozeUntil:0,lastNoticeAt:this.background?this.lastNoticeAt:0,observation:this.latest,background:this.background});let result=evaluate();
+    if(result.status==='suppressed'){reply(JSON.stringify(result));return;}
+    if(this.background){if(!this.state.watching){reply(JSON.stringify({status:'suppressed',reason:'screen-paused',retry:false}));return;}try{await this.assertScreenAllowed({mode:this.state.captureMode,frame:this.latest});}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED')throw e;reply(JSON.stringify({status:'suppressed',reason:'screen-private',retry:false}));return;}if(token!==this.generation)throw new Error('Interrupted');result=evaluate();}
+    if(result.status==='suppressed'){reply(JSON.stringify(result));return;}
+    this.lastNoticeAt=Date.now();const message=this.message('assistant',text,{source:'noticed',notice});if(this.state.spokenReplies)this.emit('speak',text);reply(JSON.stringify({...result,id:message.id}));return;
    }
    if(++this.actionCount>20)throw new Error('Tool limit reached for this reply');
    const f=this.observations.get(a.observationId);if(!f||Date.now()-f.capturedAt>15000)throw new Error('Observation expired. Observe again.');
+   await this.assertScreenAllowed({mode:this.state.captureMode,frame:f});if(token!==this.generation||!this.state.watching)throw new Error('Interrupted');
    if(tool==='screen_zoom'){
     const p=framePoint(f,a.x,a.y),q=framePoint(f,a.x+a.width,a.y+a.height);if(a.width<16||a.height<16)throw new Error('Zoom region is too small');
     const fresh=await this.observe({x:p.x,y:p.y,width:q.x-p.x,height:q.y-p.y});if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(fresh));return;
@@ -158,9 +237,9 @@ export class Companion extends EventEmitter{
    if(tool==='screen_action'){
     if(this.background)throw new Error('Application control requires a user request');if(!this.state.control)throw new Error('App control is turned off');
     let actionFrame=f;const steps=a.kind==='sequence'?a.steps:[a];if(!Array.isArray(steps)||!steps.length||steps.length>6)throw new Error('Use between one and six actions');for(const step of steps){validateAction(step);if(a.kind==='sequence'&&['focus','browser'].includes(step.kind))throw new Error('A sequence must stay in the observed window');}if(a.needsConfirmation)await this.askConfirmation(a);if(token!==this.generation||!this.state.control)throw new Error('Interrupted');
-    if(a.focusTarget&&!['focus','browser'].includes(a.kind)){const current=await this.bridge.call('target-info');if(current.id!==f.window.id){await this.bridge.call('action',{kind:'focus',query:f.window.id});const fresh=await this.observe();if(fresh.window.id!==f.window.id||fresh.width!==f.width||fresh.height!==f.height||screenDifference(Buffer.from(fresh.fingerprint,'base64'),Buffer.from(f.fingerprint,'base64'))>8){this.lastActionError='The intended window changed; no input was sent. Use this fresh observation to retry.';this.activityEvent({id:activityId,kind:'tool',title:tool,status:'failed',text:this.lastActionError,durationMs:Date.now()-started});rpc.reply(m.id,{success:false,contentItems:[{type:'inputText',text:this.lastActionError},...this.frameContent(fresh)]});return;}actionFrame=fresh;}}
+    if(a.focusTarget&&!['focus','browser'].includes(a.kind)){const current=await this.assertScreenAllowed({frame:f});if(token!==this.generation||!this.state.control)throw new Error('Interrupted');if(current.id!==f.window.id){await this.bridge.call('action',{kind:'focus',query:f.window.id});const fresh=await this.observe();if(fresh.window.id!==f.window.id||fresh.width!==f.width||fresh.height!==f.height||screenDifference(Buffer.from(fresh.fingerprint,'base64'),Buffer.from(f.fingerprint,'base64'))>8){this.lastActionError='The intended window changed; no input was sent. Use this fresh observation to retry.';this.activityEvent({id:activityId,kind:'tool',title:tool,status:'failed',text:this.lastActionError,durationMs:Date.now()-started});rpc.reply(m.id,{success:false,contentItems:[{type:'inputText',text:this.lastActionError},...this.frameContent(fresh)]});return;}actionFrame=fresh;}}
     this.publish({activity:a.reason||`Using ${a.kind}`});this.emit('action',{kind:a.kind,reason:a.reason,at:Date.now()});
-    for(const step of steps){if(token!==this.generation)throw new Error('Interrupted');if(step.kind==='browser')await this.focusBrowser();else{const request={...step,windowId:actionFrame.window.id};if(['click','doubleclick','rightclick','scroll'].includes(step.kind)&&Number.isFinite(step.x))Object.assign(request,coordinates(actionFrame,step.x,step.y));await this.bridge.call('action',request);}}
+    for(const step of steps){await this.assertScreenAllowed({frame:actionFrame});if(token!==this.generation||!this.state.running||!this.state.watching||!this.state.control)throw new Error('Interrupted');if(step.kind==='browser')await this.focusBrowser({guard:()=>{if(token!==this.generation||!this.state.control)throw new Error('Interrupted');}});else{const request={...step,windowId:actionFrame.window.id};if(['click','doubleclick','rightclick','scroll'].includes(step.kind)&&Number.isFinite(step.x))Object.assign(request,coordinates(actionFrame,step.x,step.y));await this.bridge.call('action',request);}}
     const fresh=await this.observe();if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(fresh));return;
    }
    if(this.background&&!this.state.proactive)throw new Error('Spontaneous highlights are off');
@@ -171,7 +250,13 @@ export class Companion extends EventEmitter{
  }
  async askConfirmation(action){const promise=new Promise((resolve,reject)=>{this.confirmation={resolve,reject};this.confirmationTimer=setTimeout(()=>this.confirm(false),60000);});this.emit('confirmation',{reason:action.reason||'Approve this action?',kind:action.kind});return promise;}
  confirm(approved){clearTimeout(this.confirmationTimer);const c=this.confirmation;this.confirmation=null;if(c)approved?c.resolve():c.reject(new Error('The action was declined'));this.emit('confirmation',null);}
- async interrupt(){this.generation++;this.emit('silence');this.confirm(false);if(this.starting){const p=this.starting;const r=await p.catch(()=>null);if(this.starting===p)this.starting=null;if(r?.turn?.id)this.turnId=r.turn.id;}if(this.turnId&&this.rpc){const id=this.turnId;this.ignoredTurns??=new Set();this.ignoredTurns.add(id);this.turnId=null;await this.rpc.call('turn/interrupt',{threadId:this.activeThreadId??this.threadId,turnId:id},5000).catch(()=>{});}this.finishTurn?.();this.finishTurn=null;this.publish({busy:false,background:false,activity:'Ready'});}
+ async interrupt(){
+  const token=++this.generation;this.emit('silence');this.confirm(false);
+  const threadId=this.activeThreadId??this.threadId,rpc=this.rpc,id=this.turnId,finish=this.finishTurn;this.turnId=null;this.finishTurn=null;
+  const cancel=async id=>{if(!id||!rpc)return;this.ignoredTurns??=new Set();this.ignoredTurns.add(id);await rpc.call('turn/interrupt',{threadId,turnId:id},5000).catch(()=>{});};
+  if(this.starting){const pending=this.starting;this.starting=null;const cancelled=pending.then(r=>cancel(r?.turn?.id)).catch(()=>{});await Promise.race([cancelled,new Promise(resolve=>setImmediate(resolve))]);}
+  await cancel(id);finish?.();if(token===this.generation)this.publish({busy:false,background:false,activity:'Ready'});
+ }
  async replacePrompt(prompt){
   await this.interrupt();const old=this.threadId;
   const result=await this.rpc.call('thread/start',{...this.threadParams(),baseInstructions:prompt},60000);
@@ -180,6 +265,27 @@ export class Companion extends EventEmitter{
   this.threadId=result.thread.id;this.savedThread=this.threadId;
   if(old)this.rpc.call('thread/unsubscribe',{threadId:old}).catch(()=>{});
  }
- async configure(p){if(p.model!==undefined&&this.models&&!this.models.some(m=>m.id===p.model))throw new Error('Choose an available Codex model');if(p.inputMode!==undefined&&!['always','wispr'].includes(p.inputMode))throw new Error('Choose always-on or Wispr input');if(p.prompt!==undefined&&(typeof p.prompt!=='string'||!p.prompt.trim()||p.prompt.length>32000))throw new Error('Enter a prompt between 1 and 32,000 characters');const replace=p.prompt!==undefined&&p.prompt!==this.state.prompt;if(replace&&this.state.connection==='connected')await this.replacePrompt(p.prompt);for(const k of [...settingsKeys,'running'])if(p[k]!==undefined)this.state[k]=p[k];this.state.opacity=Math.max(.45,Math.min(1,Number(this.state.opacity)||1));if(p.running===false||p.inputMode==='wispr')this.voiceEpoch=(this.voiceEpoch??0)+1;if(p.running===false||p.watching===false){await this.interrupt();this.frames=[];this.observations.clear();this.latest=null;}if(p.inputMode==='always')await this.startSpeech();this.publish();await this.save();if(this.state.running)await this.sample();return this.state;}
- async close(){this.closed=true;clearInterval(this.screenTimer);clearInterval(this.visionTimer);clearInterval(this.usageTimer);clearTimeout(this.reconnectTimer);clearTimeout(this.bridgeTimer);clearTimeout(this.speechTimer);await this.interrupt();await this.historyImport;await this.ledger?.flush();this.rpc?.close();this.speech?.close();this.bridge?.close();}
+ async noticeFeedback(id,value){
+  if(!['useful','dismiss'].includes(value))throw new Error('Choose useful or dismiss');
+  const message=this.messages.find(m=>m.id===id&&m.source==='noticed');if(!message)throw new Error('Notice not found');
+  const feedback={id,value,at:Date.now(),text:message.text,subject:message.notice?.subject??message.text};
+  this.state.noticeFeedback=[...this.state.noticeFeedback.filter(f=>f.id!==id),feedback].slice(-150);message.noticeFeedback=value;this.emit('messageUpdated',{...message});this.publish();await this.save();return this.state;
+ }
+ async configure(p){
+  if(p.model!==undefined&&this.models&&!this.models.some(m=>m.id===p.model))throw new Error('Choose an available Codex model');
+  if(p.inputMode!==undefined&&!['always','wispr'].includes(p.inputMode))throw new Error('Choose always-on or Wispr input');
+  if(p.prompt!==undefined&&(typeof p.prompt!=='string'||!p.prompt.trim()||p.prompt.length>32000))throw new Error('Enter a prompt between 1 and 32,000 characters');
+  if(p.noticeSnoozeUntil!==undefined&&(!Number.isFinite(p.noticeSnoozeUntil)||p.noticeSnoozeUntil<0))throw new Error('Choose a valid notice snooze time');
+  if(p.noticeFeedback!==undefined)throw new Error('Use feedback on a notice to update its relevance');
+  if(p.captureMode!==undefined&&!['window','monitor'].includes(p.captureMode))throw new Error('Choose window or monitor capture');
+  if(p.excludedApps!==undefined){p={...p,excludedApps:excludedApps(p.excludedApps)};this.privacyConfigurationError=null;}
+  const replace=p.prompt!==undefined&&p.prompt!==this.state.prompt;if(replace&&this.state.connection==='connected')await this.replacePrompt(p.prompt);
+  for(const k of [...settingsKeys,'running'])if(p[k]!==undefined)this.state[k]=p[k];
+  this.state.opacity=Math.max(.45,Math.min(1,Number(this.state.opacity)||1));this.state.backgroundInterval=Math.max(10000,Math.min(600000,Number(this.state.backgroundInterval)||20000));
+  if(p.running===false||p.inputMode==='wispr')this.voiceEpoch=(this.voiceEpoch??0)+1;
+  if(p.running===false||p.watching===false||p.control===false||this.background&&(p.backgroundVision===false||p.proactive===false||p.noticeSnoozeUntil>Date.now()))await this.interrupt();
+  if(p.running===false||p.watching===false||p.excludedApps!==undefined){this.clearScreen();if(!this.state.watching||!this.state.running)this.publish({screenPrivacyBlocked:false,screenPrivacyReason:null,screenWindow:null,captureSource:null});}
+  if(p.inputMode==='always')await this.startSpeech();this.publish();await this.save();if(this.state.running)await this.sample();return this.state;
+ }
+ async close(){this.closed=true;clearInterval(this.screenTimer);clearInterval(this.visionTimer);clearInterval(this.usageTimer);clearTimeout(this.reconnectTimer);clearTimeout(this.bridgeTimer);clearTimeout(this.speechTimer);await this.interrupt();await this.historyImport;await this.saveQueue;await this.ledger?.flush();this.rpc?.close();this.speech?.close();this.bridge?.close();}
 }

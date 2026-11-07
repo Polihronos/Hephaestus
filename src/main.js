@@ -1,13 +1,16 @@
 import {app,BrowserWindow,WebContentsView,ipcMain,globalShortcut,Tray,Menu,nativeImage,session,screen,powerMonitor,shell}from'electron';
-import{fileURLToPath}from'node:url';import{dirname,join}from'node:path';import{mkdir,writeFile}from'node:fs/promises';
+import{fileURLToPath}from'node:url';import{dirname,join}from'node:path';import{mkdir,writeFile}from'node:fs/promises';import{mkdirSync}from'node:fs';
 import{Companion,dynamicTools}from'./companion.js';import{readWisprShortcuts,dictationDestination,DictationSession}from'./wispr.js';import{framePoint}from'./annotations.js';
 import{T3Companion}from'./t3-companion.js';
 import{t3Tools}from'./t3-workspace.js';
 const root=join(dirname(fileURLToPath(import.meta.url)),'..');
+const qualityMode=process.argv.includes('--quality-check')||process.argv.includes('--quality-check-fast');
+if(qualityMode){const verificationData=join(root,'runtime','quality-verification');mkdirSync(verificationData,{recursive:true});app.setPath('userData',verificationData);}
 // Retain the existing data directory and desktop installation.
 app.setName('Screen Companion');app.commandLine.appendSwitch('autoplay-policy','no-user-gesture-required');
 const locked=app.requestSingleInstanceLock();if(!locked)app.quit();
 let dashboard,mascot,bubble,ink,companion,tray,quitting=false,closing=false,animation,shortcutTimer,routeTimer,recordingTimer,popupSuppressed=false,dictationTarget='mascot',bubbleResizeTimer,runtimeView,runtimeRoute,runtimeSession,runtimeDiagnostics=[];
+let trayMenuKey='';
 const dictation=new DictationSession(),icon=nativeImage.createFromPath(join(root,'assets/hephaestus-sprites/frames/idle-00.png'));
 const windows=()=>[dashboard,mascot,bubble,ink].filter(w=>w&&!w.isDestroyed());
 const safe=p=>Promise.resolve(p).catch(e=>companion?.publish({error:e.message}));
@@ -93,11 +96,14 @@ async function boot(){
  bubble=createWindow('bubble.html',{width:366,height:200,focusable:false,title:'Hephaestus · Reply'});
  ink=createWindow('ink.html',{...overlayBounds(),focusable:false,title:'Hephaestus · Highlights'});ink.setIgnoreMouseEvents(true);
  companion=new T3Companion({root,dataDir:process.argv.includes('--t3-check')?join(root,'runtime/t3-verification'):process.argv.includes('--revision-check')?join(root,'runtime/revision-verification'):process.argv.includes('--hephaestus-check')?join(root,'runtime/hephaestus-verification'):app.getPath('userData'),excludePids:[process.pid],openBrowser:()=>shell.openExternal('microsoft-edge:about:blank')});
+ if(qualityMode){companion.state.backgroundVision=false;companion.state.watching=false;}
  session.defaultSession.setPermissionRequestHandler((contents,p,cb)=>cb(p==='media'&&contents===mascot.webContents&&companion.state.inputMode==='always'&&companion.state.running));
  session.defaultSession.setPermissionCheckHandler((contents,p)=>p==='media'&&contents===mascot.webContents&&companion.state.inputMode==='always'&&companion.state.running);
  let positioned=false,wasBusy=false;
- companion.on('state',s=>{deliver('state',s);mascot.setOpacity(s.opacity);tray?.setToolTip(`Hephaestus · ${s.activity}`);if(!positioned&&s.connection==='connected'){positioned=true;if(s.mascotPosition){const p=clampPosition(s.mascotPosition);mascot.setPosition(p.x,p.y);}}if(s.busy&&!wasBusy&&!String(s.activity).startsWith('Refreshing'))showBubble();wasBusy=s.busy;});
+ companion.on('state',s=>{deliver('state',s);mascot.setOpacity(s.opacity);tray?.setToolTip(`Hephaestus · ${s.activity}`);const menuKey=String(s.running)+'/'+String((s.noticeSnoozeUntil??0)>Date.now());if(tray&&menuKey!==trayMenuKey){trayMenuKey=menuKey;tray.setContextMenu(menu());}if(!positioned&&s.connection==='connected'){positioned=true;if(s.mascotPosition){const p=clampPosition(s.mascotPosition);mascot.setPosition(p.x,p.y);}}if(s.busy&&!wasBusy&&!String(s.activity).startsWith('Refreshing'))showBubble();wasBusy=s.busy;});
  companion.on('message',m=>{deliver('message',m);if(m.role==='user'){popupSuppressed=false;send(bubble,'thinking',{});}else if(m.role==='assistant'){if(m.source==='noticed')popupSuppressed=false;showBubble();}});
+ companion.on('messageUpdated',m=>deliver('messageUpdated',m));
+ companion.on('messagesRestored',messages=>deliver('messagesRestored',messages));
  companion.on('delta',d=>{deliver('delta',d);showBubble();});
  for(const e of ['speechFlush','silence','speak','confirmation','action','responseStart','activity'])companion.on(e,d=>{deliver(e,d);if(e==='confirmation'&&d)safe(showDashboard('companion'));});
  companion.on('frame',f=>send(dashboard,'frame',f));companion.on('visionFrame',f=>send(dashboard,'visionFrame',f));
@@ -108,13 +114,28 @@ async function boot(){
   const sender=windows().find(w=>w.webContents===event.sender);if(!sender)throw new Error('Unknown caller');
   if(command==='init')return{state:companion.state,messages:companion.messages,activities:companion.activities,tools:[...dynamicTools,...t3Tools].map(t=>({name:t.name,description:t.description})),defaultPrompt:companion.defaultPrompt??'',frame:companion.latest,monitors:await companion.bridge?.call('monitors').catch(()=>[])??[],startAtLogin:app.getLoginItemSettings().openAtLogin,inkBounds:ink.getBounds()};
   if(command==='configure'){const result=await companion.configure(params);if(params.inputMode||params.inputDevice)send(mascot,'listenerRestart',{});return result;}
+  if(command==='dismiss-error'){companion.publish({error:null});return;}
+  if(command==='notice-feedback')return companion.noticeFeedback(params.id,params.value);
   if(command==='usage-report'){await companion.historyImport;return companion.ledger.report(params);}
   if(command==='runtime-view'&&sender===dashboard)return showRuntimeView(params);
   if(command==='open-link'){if(!/^https?:\/\//i.test(params.url??''))throw new Error('Only web links can open here');return shell.openExternal(params.url);}
   if(command==='send'){
    if(sender!==dashboard&&sender!==mascot)throw new Error('Use the dashboard or Wispr input');
    if(params.source==='wispr'&&!dictation.armed)throw new Error('Dictation session ended');
-   const text=String(params.text??'').trim();disarm();if(!text)return;if(companion.state.connection!=='connected')throw new Error('Codex is reconnecting. Please try again shortly.');safe(companion.submit(text,{source:params.source==='wispr'?'wispr':'text'}));return{accepted:true};
+   const text=String(params.text??'').trim();disarm();if(!text)return{accepted:false};
+   if(companion.state.sendPending)throw new Error('Your message is being sent. Please wait a moment.');
+   if(companion.state.stopping||companion.desktopActionsRevoked&&companion.t3InFlight)throw new Error('The previous request has not stopped yet. Your message has not been sent.');
+   companion.publish({sendPending:true,error:null});
+   return new Promise((resolve,reject)=>{
+    let accepted=false;
+    const acknowledge=(result={})=>{if(accepted)return;accepted=true;companion.publish({sendPending:false});resolve({accepted:true,...result});};
+    companion.submit(text,{source:params.source==='wispr'?'wispr':'text',onAccepted:acknowledge}).then(()=>{
+     if(!accepted){companion.publish({sendPending:false});reject(new Error('Your message was not sent. Please try again.'));}
+    },error=>{
+     companion.publish({sendPending:false,error:error.message});
+     if(!accepted)reject(error);
+    });
+   });
   }
   if(command==='audio'&&sender===mascot){const bytes=Buffer.from(params.audio);if(bytes.length>16000*32*4)throw new Error('Audio segment too long');safe(companion.transcribe(bytes.toString('base64')));return;}
   if(command==='voice-status'&&sender===mascot){companion.publish({listening:params.active===true,echoCancellation:params.echoCancellation??null,voiceError:params.error??null,...(!params.active?{hearing:false}:{})});return;}
@@ -153,7 +174,8 @@ async function boot(){
  if(process.argv.includes('--t3-check')){const{t3Check}=await import('../scripts/t3-check.js');await t3Check({dashboard,mascot,bubble,companion,root,showDashboard,showBubble,runtimeView:()=>runtimeView,runtimeDiagnostics:()=>runtimeDiagnostics});}
  if(process.argv.includes('--installed-check')){const{installedCheck}=await import('../scripts/installed-check.js');await installedCheck({dashboard,mascot,bubble,companion,root,showDashboard,wisprKey,runtimeView:()=>runtimeView});}
  if(process.argv.includes('--repair-check')){const{repairCheck}=await import('../scripts/repair-check.js');await repairCheck({dashboard,companion,root,showDashboard});}
+ if(qualityMode){const{qualityCheck}=await import('../scripts/quality-check.js');const passed=await qualityCheck({dashboard,mascot,bubble,companion,root,showDashboard,showBubble,app,fast:process.argv.includes('--quality-check-fast')});process.exitCode=passed?0:1;app.quit();}
 }
-function menu(){return Menu.buildFromTemplate([{label:'Open Hephaestus',click:()=>safe(showDashboard())},{label:'Voice & listening',click:()=>safe(showDashboard('voice'))},{label:'Instructions',click:()=>safe(showDashboard('instructions'))},{type:'separator'},{label:'Show / hide answer bubble',click:()=>{if(bubble.isVisible())dismissBubble();else{popupSuppressed=false;showBubble();}}},{label:'Clear highlights',click:()=>send(ink,'clearInk',{})},{label:'Stop reply · Ctrl+Alt+Esc',click:()=>safe(companion.interrupt())},{type:'separator'},{label:'Quit Hephaestus',click:()=>app.quit()}]);}
+function menu(){return Menu.buildFromTemplate([{label:'Open Hephaestus',click:()=>safe(showDashboard())},{label:'Voice & listening',click:()=>safe(showDashboard('voice'))},{label:'Instructions',click:()=>safe(showDashboard('instructions'))},{type:'separator'},{label:companion?.state.running?'Pause companion':'Resume companion',click:()=>safe(companion.configure({running:!companion.state.running}))},{label:(companion?.state.noticeSnoozeUntil??0)>Date.now()?'Resume spontaneous observations':'Quiet for 15 minutes',click:()=>safe(companion.configure({noticeSnoozeUntil:(companion.state.noticeSnoozeUntil??0)>Date.now()?0:Date.now()+15*60000}))},{type:'separator'},{label:'Show / hide answer bubble',click:()=>{if(bubble.isVisible())dismissBubble();else{popupSuppressed=false;showBubble();}}},{label:'Clear highlights',click:()=>send(ink,'clearInk',{})},{label:'Stop reply · Ctrl+Alt+Esc',click:()=>safe(companion.interrupt())},{type:'separator'},{label:'Quit Hephaestus',click:()=>app.quit()}]);}
 app.on('before-quit',e=>{if(closing)return;e.preventDefault();closing=true;quitting=true;runtimeView?.webContents.close();globalShortcut.unregisterAll();clearInterval(shortcutTimer);clearInterval(animation);clearTimeout(routeTimer);clearInterval(recordingTimer);Promise.resolve(companion?.close()).finally(()=>app.quit());});app.on('window-all-closed',()=>{});
 if(locked)app.whenReady().then(boot).catch(e=>{console.error(e);app.quit();});
