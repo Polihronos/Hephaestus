@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,readFile,rm}from'node:fs/promises';
+import {mkdtemp,readFile,rm,mkdir,writeFile}from'node:fs/promises';
 import {tmpdir}from'node:os';
 import {join}from'node:path';
 import{Companion,dynamicTools}from'../src/companion.js';
@@ -16,7 +16,21 @@ test('dictation requires an intentional shortcut and supports PTT and hands-free
 test('Caps Lock double tap enters hands-free and the next press ends it',()=>{
  const d=new DictationSession();d.key({phase:'start',at:1000});assert.equal(d.key({phase:'end',at:1100}),'tap');d.key({phase:'start',at:1200});assert.equal(d.sticky,true);assert.equal(d.key({phase:'end',at:1300}),'none');assert.equal(d.key({phase:'start',at:2200}),'finish');assert.equal(d.key({phase:'end',at:2300}),'none');
 });
-test('the actual Wispr configuration is read without transcript history or credentials',async()=>{const w=await readWisprShortcuts();assert.equal(w.found,true);assert.ok(w.bindings.some(b=>b.keys.includes(20)));assert.ok(w.labels.some(b=>b.label==='Caps Lock'));});
+test('Wispr shortcut discovery exposes only supported bindings from the configured app directory',async()=>{
+ const appData=await mkdtemp(join(tmpdir(),'companion-wispr-'));
+ try{
+  await mkdir(join(appData,'Wispr Flow'));
+  await writeFile(join(appData,'Wispr Flow','config.json'),JSON.stringify({prefs:{user:{shortcuts:{'20':'ptt','17+32+91':'popo','not-a-key':'ptt','65':'unrelated'}}},transcript:'not-exported',credentials:{token:'not-exported'}}));
+  const result=await readWisprShortcuts(appData);
+  assert.equal(result.found,true);assert.deepEqual(result.bindings.map(b=>b.keys),[[20],[17,32,91]]);assert.equal(result.labels[0].label,'Caps Lock');
+  assert.deepEqual(Object.keys(result).sort(),['bindings','found','labels']);assert.doesNotMatch(JSON.stringify(result),/not-exported|credentials|transcript/);
+ }finally{await rm(appData,{recursive:true,force:true});}
+});
+
+test('Wispr discovery is an honest unavailable result on a machine without Wispr',async()=>{
+ const appData=await mkdtemp(join(tmpdir(),'companion-without-wispr-'));
+ try{assert.deepEqual(await readWisprShortcuts(appData),{found:false,bindings:[],labels:[]});}finally{await rm(appData,{recursive:true,force:true});}
+});
 test('prompt saving replaces the sole app instruction with exactly the entered text',async()=>{
  const dir=await mkdtemp(join(tmpdir(),'companion-prompt-'));try{const c=new Companion({root:process.cwd(),dataDir:dir});Object.assign(c.state,{running:false,connection:'connected',prompt:'previous'});c.threadId='thread';let p;c.rpc={call:async(method,params)=>{if(method==='thread/start'){p=params;return {thread:{id:'new-thread'}};}return {};}};const prompt='You are my mathematics tutor. Use Greek when I ask.';await c.configure({prompt});assert.equal(p.baseInstructions,prompt);assert.equal(p.developerInstructions,'');assert.equal(p.config.project_doc_max_bytes,0);assert.equal(JSON.parse(await readFile(join(dir,'settings.json'),'utf8')).prompt,prompt);}finally{await rm(dir,{recursive:true,force:true});}
 });
