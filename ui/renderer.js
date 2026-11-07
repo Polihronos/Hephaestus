@@ -1,0 +1,17 @@
+const $=id=>document.getElementById(id),request=window.companion.request;let state={},armed=false,released=true,baseline='',autoTimer,autoTrace={},rendered=new Set();
+function notice(e){$('notice').hidden=false;$('notice').textContent=e.message??String(e);}
+function render(s){state=s;$('status').textContent=s.dictating?'Dictating with Wispr':s.busy?s.activity:s.connection==='connected'?'Here with you':s.activity;$('input-state').textContent=armed?'Wispr → companion':s.connection==='connected'?'Wispr Flow · intentional input':'Connecting to Codex…';$('send').disabled=s.connection!=='connected';document.querySelector('.bubble').classList.toggle('dictating',armed);const ptt=s.wispr?.labels?.find(b=>b.mode==='ptt');if(ptt)$('shortcut').textContent=`Hold ${ptt.label} to dictate, or type below.`;if(s.error)notice(new Error(s.error));}
+function message(m){if(rendered.has(m.id))return;rendered.add(m.id);$('welcome').hidden=true;const box=document.createElement('div');box.className='message '+m.role;const role=document.createElement('span');role.className='role';role.textContent=m.role==='user'?(m.source==='wispr'?'YOU · WISPR':'YOU'):m.role==='assistant'?'COMPANION':'NOTICE';box.append(role,document.createTextNode(m.text));$('messages').append(box);$('messages').scrollTop=$('messages').scrollHeight;if(m.role==='assistant'){$('draft').hidden=true;}}
+function maybeAutoSend(){clearTimeout(autoTimer);autoTrace={at:Date.now(),armed,released,autoSend:state.autoSend,changed:$('text-input').value.trim()!==baseline.trim()};if(!armed||!released||!state.autoSend||$('text-input').value.trim()===baseline.trim()||!$('text-input').value.trim())return;autoTrace.scheduled=true;autoTimer=setTimeout(()=>{autoTrace.fired=true;autoTrace.firedAt=Date.now();send('wispr');},450);}
+async function send(source='text'){clearTimeout(autoTimer);const text=$('text-input').value.trim();if(!text)return;try{const r=await request('send',{text,source});if(r?.accepted){$('text-input').value='';armed=false;baseline='';$('notice').hidden=true;}}catch(e){notice(e);}$('text-input').focus();}
+window.companion.onEvent((e,d)=>{
+ if(e==='state')render(d);if(e==='message')message(d);
+ if(e==='delta'){$('welcome').hidden=true;$('draft').hidden=false;$('draft').textContent=d.full;}
+ if(e==='focusInput')$('text-input').focus();
+ if(e==='dictation'){armed=d.armed;released=!d.armed;if(d.armed){baseline=$('text-input').value;$('text-input').focus();}else clearTimeout(autoTimer);render(state);}
+ if(e==='dictationReleased'){released=true;maybeAutoSend();}
+});
+$('text-input').addEventListener('paste',()=>{if(armed){released=true;request('dictation-complete').catch(notice);}});$('text-input').addEventListener('input',maybeAutoSend);$('text-input').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}if(e.key==='Escape'){request('interrupt');request('hide');}};
+$('text-form').onsubmit=e=>{e.preventDefault();send();};$('hide').onclick=()=>request('hide');$('settings').onclick=()=>request('show-settings');$('focus').onclick=()=>request('ink-mode',{mode:'attention'});$('draw').onclick=()=>request('ink-mode',{mode:'draw'});$('stop').onclick=()=>request('interrupt');
+const initial=await request('init');render(initial.state);initial.messages.forEach(message);
+window.companionInspect=()=>({armed,released,autoTrace,microphoneActive:false,input:$('text-input').value,messageCount:rendered.size,notice:$('notice').hidden?null:$('notice').textContent});

@@ -1,0 +1,224 @@
+{
+  "character": "Hephaestus",
+  "frameSize": {
+    "width": 64,
+    "height": 80
+  },
+  "anchorPixels": {
+    "x": 32,
+    "y": 74
+  },
+  "atlas": "sheets/hephaestus-atlas.png",
+  "walkRowOrder": [
+    "walk-south",
+    "walk-southwest",
+    "walk-west",
+    "walk-northwest",
+    "walk-north",
+    "walk-northeast",
+    "walk-east",
+    "walk-southeast"
+  ],
+  "animations": [
+    {
+      "name": "walk-south",
+      "frames": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "durationsMs": [
+        110,
+        110,
+        110,
+        110,
+        110,
+        110
+      ],
+      "loop": true
+    },
+    {
+      "name": "walk-southwest",
+      "frames": [
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "durationsMs": [
+        110,
+        110,
+        110,
+        110,
+        110,
+        110
+      ],
+      "loop": true
+    },
+    {
+      "name": "walk-west",
+      "frames": [
+        12,
+        13,
+        14,
+        15,
+        16,
+        17
+      ],
+      "durationsMs": [
+        110,
+        110,
+        110,
+        110,
+        110,
+        110
+      ],
+      "loop": true
+    },
+    {
+      "name": "walk-northwest",
+      "frames": [
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "durationsMs": [
+        110,
+        110,
+        110,
+        110,
+        110,
+        110
+      ],
+      "loop": true
+    },
+    {
+      "name": "walk-north",
+      "frames": [
+        24,
+        25,
+        26,
+        27,
+        28,
+        29
+      ],
+      "durationsMs": [
+        110,
+        110,
+        110,
+        110,
+        110,
+        110
+      ],
+      "loop": true
+    },
+    {
+      "name": "walk-northeast",
+      "frames": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "durationsMs": [
+        110,
+        110,
+        110,
+        110,
+        110,
+        110
+      ],
+      "loop": true
+    },
+    {
+      "name": "walk-east",
+      "frames": [
+        36,
+        37,
+        38,
+        39,
+        40,
+        41
+      ],
+      "durationsMs": [
+        110,
+        110,
+        110,
+        110,
+        110,
+        110
+      ],
+      "loop": true
+    },
+    {
+      "name": "walk-southeast",
+      "frames": [
+        42,
+        43,
+        44,
+        45,
+        46,
+        47
+      ],
+      "durationsMs": [
+        110,
+        110,
+        110,
+        110,
+        110,
+        110
+      ],
+      "loop": true
+    },
+    {
+      "name": "hammer-strike",
+      "frames": [
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55
+      ],
+      "durationsMs": [
+        160,
+        110,
+        180,
+        65,
+        100,
+        120,
+        110,
+        160
+      ],
+      "loop": true
+    },
+    {
+      "name": "idle",
+      "frames": [
+        56,
+        57,
+        58,
+        59
+      ],
+      "durationsMs": [
+        240,
+        240,
+        240,
+        240
+      ],
+      "loop": true
+    }
+  ]
+}

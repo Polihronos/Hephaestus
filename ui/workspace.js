@@ -1,0 +1,8 @@
+export function createWorkspace(request,navigate){
+ const nav=document.createElement('button');nav.dataset.page='workspace';nav.innerHTML='<span>⌘</span> Workspace';document.querySelector('nav').append(nav);
+ const view=document.createElement('section');view.dataset.view='workspace';view.className='view';view.hidden=true;view.innerHTML='<div class="workspace-topline"><p>The T3 runtime behind Hephaestus. Tools, files, request cards, and the full conversation.</p><button id="workspace-conversation">Hephaestus conversation</button></div><div id="native-workspace-slot"></div>';document.querySelector('.content').append(view);
+ let route='thread',active=false,selectCost=false,navigateRequested=false;const slot=view.querySelector('#native-workspace-slot');
+ function sync(){const b=slot.getBoundingClientRect(),openCost=selectCost,openRoute=navigateRequested;selectCost=false;navigateRequested=false;request('runtime-view',{visible:active,route,selectCost:openCost,navigateToRoute:openRoute,bounds:{x:Math.round(b.x),y:Math.round(b.y),width:Math.round(b.width),height:Math.round(b.height)}}).catch(()=>{});}
+ new ResizeObserver(sync).observe(slot);window.addEventListener('resize',sync);window.addEventListener('hephaestus-workspace',e=>{route=e.detail??'thread';selectCost=route==='usage';navigateRequested=true;navigate('workspace');});document.getElementById('workspace-conversation').onclick=()=>{route='thread';navigateRequested=true;sync();};
+ return{navigate(page){active=page==='workspace';if(active)navigateRequested=true;requestAnimationFrame(sync);},updateState(state){if(active&&state.connection==='connected')sync();}};
+}

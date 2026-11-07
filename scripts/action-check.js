@@ -1,0 +1,30 @@
+import { Companion } from '../src/companion.js';
+import { ProcessRpc } from '../src/process-rpc.js';
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { mkdir,writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+const root=process.cwd();await mkdir('runtime/action-check',{recursive:true});await mkdir('artifacts',{recursive:true});
+const c=new Companion({root,dataDir:join(root,'runtime/action-check'),openBrowser:async()=>{}});
+const records=[];let fixture,lines;
+c.on('message',m=>{records.push(m);console.log(m.role+': '+m.text);});
+c.on('action',m=>console.log('Action:',JSON.stringify(m)));
+c.on('toolError',m=>{records.push({toolError:m});console.log('Tool error:',JSON.stringify(m));});
+try{
+  c.bridge=new ProcessRpc(join(root,'native/bin/release/ScreenBridge.exe')).start();await c.connect();c.state.running=true;
+  fixture=spawn(join(root,'native/bin/release/ScreenBridge.exe'),['--test-window'],{windowsHide:true,stdio:['ignore','pipe','pipe']});
+  lines=createInterface({input:fixture.stdout});
+  let ready,clicked;const readyPromise=new Promise(r=>ready=r);const clickPromise=new Promise(r=>clicked=r);
+  lines.on('line',line=>{try{const event=JSON.parse(line);records.push(event);if(event.eventName==='ready')ready(event);if(event.eventName==='click')clicked(event);}catch{}});
+  const f=await Promise.race([readyPromise,new Promise((_,reject)=>setTimeout(()=>reject(new Error('Test window did not start')),10000))]);
+  await new Promise(r=>setTimeout(r,400));
+  const available=await c.bridge.call('windows');
+  console.log('Verification window:',JSON.stringify(available.filter(w=>w.title.includes('verification'))));
+  await c.bridge.call('action',{kind:'focus',query:f.windowId});
+  const started=Date.now();const keyboard=process.argv.includes('--keyboard');
+  await c.turn(keyboard?"In the Screen Companion input verification window, click the Keyboard verification area, type 'Voice → screen ✓', press Ctrl+A, and replace it with 'Keyboard verified.'. Check the resulting text. Use only the screen tools.":'In the Screen Companion input verification window, click the Increment button exactly once. Verify the resulting Click count and tell me what it says. Use the screen tools. Do not use shell commands.');
+  const click=keyboard?null:await Promise.race([clickPromise,new Promise(r=>setTimeout(()=>r(null),1000))]);
+  const report={verified:keyboard?records.some(r=>r.eventName==='text'&&r.text==='Keyboard verified.'):click?.count===1,totalMs:Date.now()-started,firstReplyMs:c.state.lastReplyMs,records};
+  await writeFile(`artifacts/${keyboard?'keyboard':'action'}-check.json`,JSON.stringify(report,null,2));console.log(JSON.stringify({verified:report.verified,totalMs:report.totalMs}));
+  if(!report.verified)process.exitCode=1;
+}finally{lines?.close();fixture?.kill();await c.close();}

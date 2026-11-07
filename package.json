@@ -1,0 +1,29 @@
+{
+  "name": "screen-companion",
+  "version": "3.0.0",
+  "description": "A screen-aware Windows desktop companion with voice, app controls, and an animated Hephaestus.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Polihronos/Hephaestus.git"
+  },
+  "private": true,
+  "type": "module",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node scripts/launch.cjs",
+    "test": "node --test test/*.test.js",
+    "probe": "node scripts/probe.js",
+    "setup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup.ps1",
+    "check": "node scripts/check.js",
+    "prepare-ui": "node scripts/prepare-ui.js"
+  },
+  "devDependencies": {
+    "electron": "^45.2.3"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.17",
+    "marked": "^18.1.3",
+    "ws": "^8.22.1"
+  }
+}

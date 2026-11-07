@@ -1,0 +1,20 @@
+import{VoiceActivity}from'./audio-utils.js';
+export function createListener(request){
+ let state={},key='',version=0,stream,context,source,capture,lastLevel=0,settings=null,error=null,calibration=null;
+ const vad=new VoiceActivity({threshold:.012,silenceMs:650,onStart:()=>request('voice-start').catch(()=>{}),onEnd:audio=>request('audio',{audio:audio.buffer}).catch(()=>{}),onCancel:()=>request('voice-idle').catch(()=>{})});
+ function stop(){version++;vad.reset();for(const t of stream?.getTracks()??[])t.stop();stream=null;source?.disconnect();capture?.disconnect();context?.close().catch(()=>{});source=capture=context=null;settings=null;request('voice-status',{active:false}).catch(()=>{});}
+ async function start(){
+  const epoch=version;try{
+   const s=await navigator.mediaDevices.getUserMedia({audio:{deviceId:state.inputDevice&&state.inputDevice!=='default'?{exact:state.inputDevice}:undefined,echoCancellation:{exact:'all'},noiseSuppression:true,autoGainControl:true,channelCount:1}});
+   if(epoch!==version){s.getTracks().forEach(t=>t.stop());return;}stream=s;settings=s.getAudioTracks()[0].getSettings();if(settings.echoCancellation!=='all')throw new Error('System-wide echo cancellation is unavailable for this device. Select another microphone or use Wispr.');
+   context=new AudioContext({sampleRate:16000});await context.audioWorklet.addModule('./microphone-worklet.js');if(epoch!==version)return;await context.resume();source=context.createMediaStreamSource(stream);capture=new AudioWorkletNode(context,'microphone-capture');
+   capture.port.onmessage=event=>{if(epoch!==version)return;const {samples,rms}=event.data;if(calibration)calibration.clean.push(samples);if(Date.now()-lastLevel>100){lastLevel=Date.now();request('voice-level',{rms}).catch(()=>{});}if(state.dictating||state.calibrating||state.speech!=='ready'){if(vad.active)request('voice-idle').catch(()=>{});vad.reset();return;}vad.push(samples,rms);};source.connect(capture);capture.connect(context.destination);
+   stream.getAudioTracks()[0].onended=()=>{if(epoch===version){error='Microphone disconnected';stop();request('voice-status',{active:false,error}).catch(()=>{});}};
+   error=null;request('voice-status',{active:true,echoCancellation:settings.echoCancellation}).catch(()=>{});
+  }catch(e){if(epoch!==version)return;error=e.message;stop();request('voice-status',{active:false,error}).catch(()=>{});}
+ }
+ function configure(next){state=next;const wanted=`${state.inputMode}/${state.running}/${state.inputDevice}`;if(wanted===key)return;key=wanted;stop();if(state.inputMode==='always'&&state.running)start();}
+ async function beginCalibration(){if(!stream?.active||!context)throw new Error('Open the always-on microphone first');const rawStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});const rawSource=context.createMediaStreamSource(rawStream),rawCapture=new AudioWorkletNode(context,'microphone-capture');calibration={clean:[],raw:[],rawStream,rawSource,rawCapture};rawCapture.port.onmessage=e=>calibration?.raw.push(e.data.samples);rawSource.connect(rawCapture);rawCapture.connect(context.destination);return true;}
+ function finishCalibration(){if(!calibration)return null;const c=calibration;calibration=null;c.rawStream.getTracks().forEach(t=>t.stop());c.rawSource.disconnect();c.rawCapture.disconnect();const combine=chunks=>{const buffer=new Float32Array(chunks.reduce((n,c)=>n+c.length,0));let i=0;for(const chunk of chunks){buffer.set(chunk,i);i+=chunk.length;}let sum=0;for(const value of buffer)sum+=value*value;const bytes=new Uint8Array(buffer.buffer);let binary='';for(let n=0;n<bytes.length;n+=8192)binary+=String.fromCharCode(...bytes.subarray(n,n+8192));return{audio:btoa(binary),rms:Math.sqrt(sum/Math.max(1,buffer.length)),samples:buffer.length};};return{raw:combine(c.raw),clean:combine(c.clean)};}
+ return{configure,stop,beginCalibration,finishCalibration,restart:()=>{key='';configure(state);},inspect:()=>({microphoneActive:!!stream?.active,echoCancellation:settings?.echoCancellation,sampleRate:context?.sampleRate,error})};
+}

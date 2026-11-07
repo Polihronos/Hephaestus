@@ -1,0 +1,12 @@
+{
+  "frameCount": 60,
+  "dimensions": [
+    64,
+    80
+  ],
+  "paletteColors": 24,
+  "alpha": "binary 0/255",
+  "uniqueFrames": 60,
+  "clippedFrames": [],
+  "unexpectedColors": 0
+}
