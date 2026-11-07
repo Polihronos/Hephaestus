@@ -119,3 +119,72 @@ test('pausing or snoozing during a pending watcher target check prevents inferen
  const c=companion();c.state.connection='connected';c.lastWatchAt=0;c.latest=frame();let resolve,turns=0;c.turn=async()=>turns++;c.bridge={call:()=>new Promise(r=>resolve=r)};
  const pending=c.watch();c.state.noticeSnoozeUntil=Date.now()+10000;resolve({id:'app',process:'editor'});await pending;assert.equal(turns,0);
 });
+
+function noticeCompanion({capturedAt=Date.now()}={}){
+ const c=companion();Object.assign(c.state,{busy:true,connection:'connected'});c.background=true;c.threadId='thread';c.activeThreadId='thread';c.turnId='turn';c.messages=[{role:'user',text:context.lastUserMessage.text,at:Date.now()}];let captures=0;
+ c.bridge={call:async command=>{if(command==='target-info')return{id:'app',process:'editor'};if(command==='capture')return frame('editor',{capturedAt:captures++===0?capturedAt:Date.now()});throw Error(command);}};
+ return c;
+}
+async function submitNotice(c,args){
+ let response;await c.onTool({id:'notice-call',method:'item/tool/call',params:{threadId:c.activeThreadId,turnId:c.turnId,tool:'companion_notice',arguments:args}},{reply:(_id,result)=>response=result});
+ assert.equal(response.success,true);return JSON.parse(response.contentItems[0].text);
+}
+
+test('a notice uses its model-delivered observation despite intervening local previews',async()=>{
+ const c=noticeCompanion(),delivered=await c.observe();c.frameContent(delivered);await c.sample();
+ assert.notEqual(c.latest.id,delivered.id);assert.equal(c.observations.get(delivered.id),delivered);
+ const result=await submitNotice(c,{...notice,observationId:delivered.id});assert.equal(result.status,'shown');assert.equal(c.messages.at(-1).source,'noticed');
+});
+
+test('notice without an ID selects the last model-visible image rather than the newest preview',async()=>{
+ const c=noticeCompanion(),delivered=await c.observe();c.frameContent(delivered);await c.sample();const{observationId,...withoutId}=notice;
+ assert.equal(c.modelObservation().id,delivered.id);assert.notEqual(c.modelObservation().id,c.latest.id);
+ assert.equal((await submitNotice(c,withoutId)).status,'shown');
+});
+
+test('a fresh local preview never renews expired model evidence with or without an observation ID',async()=>{
+ for(const includeId of[true,false]){
+  const c=noticeCompanion({capturedAt:Date.now()-60000}),expired=await c.observe();c.frameContent(expired);await c.sample();
+  const{observationId,...withoutId}=notice;const args=includeId?{...notice,observationId:expired.id}:withoutId;
+  assert.ok(Date.now()-c.latest.capturedAt<1000);assert.equal((await submitNotice(c,args)).reason,'stale-observation');assert.equal(c.messages.filter(m=>m.source==='noticed').length,0);
+ }
+});
+
+test('unknown, preview-only and captured-but-undelivered IDs cannot justify a notice',async()=>{
+ for(const source of['unknown','preview','unseen-observation']){
+  const c=noticeCompanion(),delivered=await c.observe();c.frameContent(delivered);await c.sample();
+  const id=source==='unknown'?'unknown':source==='preview'?c.latest.id:(await c.observe()).id;
+  assert.equal((await submitNotice(c,{...notice,observationId:id})).reason,'stale-observation');
+ }
+ const c=noticeCompanion();await c.sample();const{observationId,...withoutId}=notice;
+ assert.equal((await submitNotice(c,withoutId)).reason,'stale-observation');
+});
+
+test('previous-generation model images cannot support either explicit or implicit notice evidence',async()=>{
+ for(const includeId of[true,false]){
+  const c=noticeCompanion(),delivered=await c.observe();c.frameContent(delivered);c.generation++;c.turnId='new-turn';await c.sample();
+  const{observationId,...withoutId}=notice;assert.equal((await submitNotice(c,includeId?{...notice,observationId:delivered.id}:withoutId)).reason,'stale-observation');
+ }
+});
+
+test('model observation registration requires the retained frame and current generation',async()=>{
+ const c=noticeCompanion(),delivered=await c.observe(),generation=c.generation;c.markModelObservation(delivered,{generation});
+ assert.equal(c.modelObservation(delivered.id).capturedAt,delivered.capturedAt);
+ assert.throws(()=>c.markModelObservation({...delivered}),/no longer available/);
+ c.generation++;assert.throws(()=>c.markModelObservation(delivered,{generation}),/interrupted/);assert.equal(c.modelObservation(delivered.id),null);
+ c.markModelObservation(delivered);assert.equal(c.modelObservation().id,delivered.id);c.observations.delete(delivered.id);assert.equal(c.modelObservation(delivered.id),null);
+});
+
+test('privacy clearing invalidates delivered-image evidence until another image is delivered',async()=>{
+ const c=noticeCompanion(),delivered=await c.observe();c.frameContent(delivered);c.clearScreen();await c.sample();const{observationId,...withoutId}=notice;
+ assert.equal(c.modelObservation(),null);assert.equal((await submitNotice(c,withoutId)).reason,'stale-observation');
+});
+
+test('initial core turn image input is registered before dispatch and stays distinct from preview',async()=>{
+ const c=noticeCompanion();let dispatched=false;
+ c.rpc={call:async(method,params)=>{
+  assert.equal(method,'turn/start');const metadata=JSON.parse(params.input.find(item=>item.type==='text'&&item.text.includes('screen_observation')).text);
+  assert.equal(c.modelObservation().id,metadata.observationId);await c.sample();assert.notEqual(c.latest.id,metadata.observationId);assert.equal(c.modelObservation().id,metadata.observationId);dispatched=true;setImmediate(()=>c.finishTurn?.());return{turn:{id:'model-turn'}};
+ }};
+ await c.turn('Fix the Prisma migration');assert.equal(dispatched,true);
+});

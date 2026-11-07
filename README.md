@@ -16,6 +16,8 @@ Hephaestus can selectively point out useful things with temporary highlights and
 
 The conversation can take the full dashboard width with **Hide screen**. Streaming replies stay in the conversation; reading older messages preserves your position and offers **Latest** to catch up. Messages stay in the composer until their dispatch is acknowledged, and a failed send remains available for review and retry. Reconnection restores active work and missing replies from the runtime. **Stop** reports whether cancellation is confirmed; local desktop actions are revoked immediately even if the runtime cannot confirm the stop.
 
+Messages over 16,000 characters are rejected visibly and remain intact for editing. Failed intentional dictation is saved as a recoverable request in the dashboard. Instruction changes wait for confirmed cancellation before replacing the active conversation. Upgrades replace a previous default prompt only when its exact known fingerprint matches; custom instructions remain unchanged.
+
 ## Attention and screen privacy
 
 **What I see** includes **Quiet for 15 minutes**, **an hour**, or **4 hours**. Direct replies continue while spontaneous observations are snoozed. Each unsolicited notice has **Helpful** and **Dismiss** controls; feedback survives restarts and helps suppress repeated subjects. Notices must include a current task, fresh visible evidence, a concrete next action, and its benefit. Duplicate suppression uses Unicode text similarity; it does not translate meanings or verify that a visual claim is correct.
@@ -49,7 +51,7 @@ When proactive mode is on, context refresh checks a changed screen at the config
 
 Movement has two triggers: dragging the sprite, or a model call to `move_attention`. That call can occur in a direct reply or a proactive screen check. There is no random wandering timer or requirement to move on every refresh.
 
-Unambiguous commands such as ?next tab,? ?scroll down,? and ?click here? execute locally without a model request. They verify the intended target and stop if focus changes; ambiguous browser targets require you to focus the right window. Other requests use the conversation model.
+Unambiguous commands such as "next tab," "scroll down," and "click here" execute locally without a model request. They verify the intended target and stop if focus changes; ambiguous browser targets require you to focus the right window. Other requests use the conversation model.
 
 The default model is Luna 6 with low reasoning effort and standard service. The watcher always uses this economical configuration; conversation model and effort remain configurable. Replies render streamed text immediately; native action sequences combine up to six operations and typing uses batched Windows input. The application rejects API-key authentication and never purchases additional usage.
 
@@ -81,7 +83,9 @@ Setup installs local transcription dependencies, verifies the public speech mode
 
 `node scripts/launch.cjs --hephaestus-check` verifies the dashboard, supplied sprite, real microphone echo mode, audible playback rejection, actual speech, popup attachment and dismissal, and a real model-controlled click in a temporary verification window. `--route-check` checks invisible Wispr routing and the current microphone mode. `--t3-check` verifies Luna through the real T3 runtime, inherited and desktop tools, native typing, proactive notices, Markdown, usage records, and the embedded workspace. Reports and actual screenshots go under `artifacts/`.
 
-`node scripts/launch.cjs --quality-check-fast` checks the actual production windows at 960?620 and 1280?840, screen-pause behavior, navigation, and microphone defaults without model inference. `--quality-check` adds real local-command measurements, contextual replies, native typing through the conversation runtime, and snapshot reconciliation. These checks use a separate `runtime/quality-verification` data directory; they do not reset the normal application settings or conversation. The full check needs the signed-in allowance and briefly opens an input-verification window. Unit tests use isolated fixtures and do not require a signed-in account. The Windows build and automated tests also run in GitHub Actions.
+`node scripts/launch.cjs --quality-check-fast` checks the actual production windows at 960x620 and 1280x840, screen-pause behavior, navigation, and microphone defaults without model inference. `--quality-check` adds real local-command measurements, contextual replies, native typing through the conversation runtime, and snapshot reconciliation. These checks use a separate `runtime/quality-verification` data directory; they do not reset the normal application settings or conversation. The full check needs the signed-in allowance and briefly opens an input-verification window. Unit tests use isolated fixtures and do not require a signed-in account. The Windows build and automated tests also run in GitHub Actions.
+
+`node scripts/launch.cjs --session-check` exercises actual UI sends, connection loss during a reply, missing-reply reconciliation, cancellation and a subsequent request in a separate `runtime/session-verification` profile. It uses real model replies; its missing-cache-entry and action-free approval fault injections are labelled in the report. Screenshots, transcripts and token data are not fabricated. These short checks do not establish human speech accuracy or all-day proactive usefulness. Verification failures return a nonzero exit code.
 
 ## License
 

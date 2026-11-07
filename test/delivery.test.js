@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDictation } from '../ui/dictation.js';
+import {userErrorMessage} from '../ui/errors.js';
+import {Companion,MAX_MESSAGE_LENGTH} from '../src/companion.js';
 
 class Input extends EventTarget {
   constructor(value) { super(); this.value = value; }
@@ -59,4 +61,24 @@ test('a pending send in another window prevents a second dispatch', async () => 
   await dictation.submit();
   assert.equal(sends, 0);
   assert.equal(input.value, 'Another window');
+});
+
+test('transport error decoration is removed without losing actionable guidance',()=>{
+  assert.equal(userErrorMessage(new Error("Error invoking remote method 'companion:request': Error: Enter executable process names, for example chrome.exe")),'Enter executable process names, for example chrome.exe');
+  assert.equal(userErrorMessage(new RangeError('Shorten your message.')),'Shorten your message.');
+  assert.equal(userErrorMessage('The window changed. Observe it again.'),'The window changed. Observe it again.');
+});
+
+test('oversized dictation retains its entire original text when the backend rejects it',async()=>{
+  const raw='  '+ 'Я'.repeat(MAX_MESSAGE_LENGTH)+'\n',input=new Input(raw),c=new Companion({root:process.cwd(),dataDir:process.cwd()});
+  let failure;
+  const dictation=createDictation(input,(_command,params)=>c.submit(params.text),{onError:error=>{failure=error;}});
+  await dictation.submit('wispr');
+  assert.equal(input.value,raw);assert.equal(failure.code,'MESSAGE_TOO_LONG');assert.equal(c.messages.length,0);
+});
+
+test('accepted input reaches the backend without losing formatting whitespace',async()=>{
+  const raw='  an indented request\n',input=new Input(raw);let sent;
+  const dictation=createDictation(input,async(_command,params)=>{sent=params.text;return{accepted:true};});
+  await dictation.submit();assert.equal(sent,raw);assert.equal(input.value,'');
 });

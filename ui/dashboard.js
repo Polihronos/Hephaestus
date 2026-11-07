@@ -3,6 +3,7 @@ import {renderMarkdown} from './markdown.js';
 import {createDictation} from './dictation.js';
 import {createTelemetry} from './telemetry.js';
 import {fastCommand} from '../src/commands.js';
+import {userErrorMessage} from './errors.js';
 
 const $ = id => document.getElementById(id);
 const rawRequest = window.companion.request;
@@ -17,10 +18,11 @@ const time = value => new Date(value).toLocaleTimeString([], {hour:'2-digit', mi
 function announce(text) { $('conversation-announcer').textContent = text; }
 function notice(error, {retry = null, title = 'Something needs attention', source = 'local'} = {}) {
   $('notice-title').textContent = title;
-  $('notice-message').textContent = error?.message ?? String(error);
+  $('notice-message').textContent = userErrorMessage(error);
   $('notice').hidden = false;
   retryNotice = retry; noticeSource = source;
   $('notice-retry').hidden = !retry;
+  if(source!=='state')$('notice').scrollIntoView({block:'nearest'});
 }
 function hideNotice() { $('notice').hidden = true; retryNotice = null; noticeSource = ''; }
 async function perform(command, params, {retry = true} = {}) {
@@ -262,11 +264,23 @@ for (const [id,sent] of [['view-live',false],['view-sent',true]]) $(id).onclick 
 $('notice-dismiss').onclick = () => { hideNotice(); rawRequest('dismiss-error').catch(() => {}); };
 $('notice-retry').onclick = async () => { const retry = retryNotice; if (!retry) return; hideNotice(); await retry(); };
 $('prompt').oninput = () => { dirty = true; $('prompt-status').textContent = 'Unsaved changes'; $('prompt-count').textContent = `${$('prompt').value.length.toLocaleString()} / 32,000`; };
-$('save-prompt').onclick = async () => { $('save-prompt').disabled = true; $('save-prompt').textContent = 'Saving…'; try { await request('configure',{prompt:$('prompt').value}); dirty = false; $('prompt-status').textContent = 'Saved · active now'; hideNotice(); } catch (error) { notice(error,{retry:() => $('save-prompt').click()}); } finally { $('save-prompt').disabled = false; $('save-prompt').textContent = 'Save instructions'; } };
+$('save-prompt').onclick = async () => {
+  const submitted=$('prompt').value;$('save-prompt').disabled=true;$('save-prompt').textContent='Saving…';
+  try{await request('configure',{prompt:submitted});dirty=$('prompt').value!==submitted;$('prompt-status').textContent=dirty?'Earlier version saved · new changes are unsaved':'Saved · active now';hideNotice();}
+  catch(error){notice(error,{retry:()=>$('save-prompt').click()});}
+  finally{$('save-prompt').disabled=false;$('save-prompt').textContent='Save instructions';}
+};
 $('restore-prompt').onclick = () => { $('prompt').value = defaultPrompt; dirty = true; $('prompt').oninput(); $('prompt-status').textContent = 'Default restored · save to apply'; };
 $('approve').onclick = () => perform('confirm',{approved:true},{retry:false}); $('decline').onclick = () => perform('confirm',{approved:false},{retry:false});
-$('excluded-apps').oninput = () => { privacyDirty = true; $('privacy-status').textContent = 'Unsaved changes'; };
-$('save-privacy').onclick = async () => { const excludedApps = [...new Set($('excluded-apps').value.split(/[\n,;]+/).map(value => value.trim()).filter(Boolean))]; $('save-privacy').disabled = true; try { await request('configure',{excludedApps}); privacyDirty = false; $('privacy-status').textContent = 'Private apps saved.'; hideNotice(); } catch (error) { notice(error,{retry:() => $('save-privacy').click()}); } finally { $('save-privacy').disabled = false; } };
+$('excluded-apps').setAttribute('aria-describedby','privacy-help privacy-status');
+$('excluded-apps').oninput = () => { privacyDirty = true; $('excluded-apps').removeAttribute('aria-invalid');$('privacy-status').classList.remove('field-error');$('privacy-status').setAttribute('role','status');$('privacy-status').textContent = 'Unsaved changes'; };
+$('save-privacy').onclick = async () => {
+  const submitted=$('excluded-apps').value,excludedApps=[...new Set(submitted.split(/[\n,;]+/).map(value=>value.trim()).filter(Boolean))];
+  $('save-privacy').disabled=true;
+  try{await request('configure',{excludedApps});privacyDirty=$('excluded-apps').value!==submitted;$('excluded-apps').removeAttribute('aria-invalid');$('privacy-status').classList.remove('field-error');$('privacy-status').setAttribute('role','status');$('privacy-status').textContent=privacyDirty?'Earlier list saved · new changes are unsaved':'Private apps saved.';hideNotice();}
+  catch(error){$('excluded-apps').setAttribute('aria-invalid','true');$('privacy-status').classList.add('field-error');$('privacy-status').setAttribute('role','alert');$('privacy-status').textContent=userErrorMessage(error);$('excluded-apps').focus({preventScroll:true});$('excluded-apps').scrollIntoView({block:'center'});$('privacy-status').scrollIntoView({block:'nearest'});}
+  finally{$('save-privacy').disabled=false;}
+};
 $('notice-snooze').onchange = () => { if ($('notice-snooze').value === 'active') return; const minutes = Number($('notice-snooze').value); perform('configure',{noticeSnoozeUntil:minutes ? Date.now() + minutes * 60000 : 0}); };
 function voices() { $('voice').replaceChildren(new Option('Windows default',''),...speechSynthesis.getVoices().filter(voice => voice.localService).map(voice => new Option(`${voice.name} · ${voice.lang}`,voice.name))); $('voice').value = state.voice ?? ''; }
 speechSynthesis.onvoiceschanged = voices; voices();

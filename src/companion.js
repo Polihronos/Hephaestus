@@ -10,7 +10,10 @@ import { validateAnnotation, framePoint } from './annotations.js';
 import {TokenLedger} from './token-ledger.js';
 import {PrivacyBlockedError,excludedApps,excludedProcess} from './privacy.js';
 import {evaluateNotice,NOTICE_COOLDOWN} from './notice-policy.js';
+import {preserveFailedVoiceInput} from './input-recovery.js';
+import {readPromptSettings,defaultPromptHash} from './settings-migrations.js';
 export {PrivacyBlockedError} from './privacy.js';
+export const MAX_MESSAGE_LENGTH=16000;
 
 export const dynamicTools=[
  {type:'function',name:'screen_observe',description:'Get a fresh screenshot and observationId. Choose monitor to see the desktop, Start menu, or multiple apps; window gives the active app clearly.',inputSchema:{type:'object',properties:{mode:{type:'string',enum:['window','monitor']},monitor:{type:'integer'}},additionalProperties:false}},
@@ -28,12 +31,13 @@ export class Companion extends EventEmitter{
  constructor({root,dataDir,excludePids=[],openBrowser}){super();Object.assign(this,{root,dataDir,excludePids,openBrowser});this.state={name:'Hephaestus',connection:'connecting',plan:null,model:'gpt-6-luna',effort:'low',running:true,watching:true,backgroundVision:true,spokenReplies:false,monitor:-1,busy:false,activity:'Connecting',inputMode:'wispr',inputDevice:'default',control:true,proactive:true,captureMode:'window',backgroundInterval:20000,opacity:1,autoSend:true,voice:'',prompt:'',speech:'off',listening:false,usage:null,error:null,excludedApps:[],noticeSnoozeUntil:0,noticeFeedback:[],screenPrivacyBlocked:false,screenPrivacyReason:null};this.frames=[];this.observations=new Map();this.messages=[];this.activities=[];this.generation=0;this.closed=false;this.lastWatchAt=Date.now();this.spokenHistory=[];}
  publish(extra={}){Object.assign(this.state,extra);this.emit('state',{...this.state});}
  message(role,text,extra={}){const m={id:randomUUID(),role,text,at:Date.now(),...extra};this.messages.push(m);this.messages=this.messages.slice(-120);this.emit('message',m);if(this.threadId)this.save().catch(()=>{});return m;}
- async start(){await mkdir(this.dataDir,{recursive:true});this.defaultPrompt=await readFile(join(this.root,'assets','system-prompt.txt'),'utf8');let s={};try{s=JSON.parse(await readFile(join(this.dataDir,'settings.json'),'utf8'));}catch{}for(const k of settingsKeys)if(s[k]!==undefined)this.state[k]=s[k];if(!s.defaultsRevision){this.state.inputMode='wispr';this.state.spokenReplies=false;}if(!s.lunaRevision){this.state.model='gpt-6-luna';this.state.effort='low';}if(!this.state.prompt||(s.promptVersion<4&&this.state.prompt.startsWith('You are my spoken screen companion.')))this.state.prompt=this.defaultPrompt;this.messages=(s.messages??[]).filter(m=>m&&typeof m.text==='string').slice(-120);for(const m of this.messages)this.emit('message',m);this.savedThread=s.promptVersion===4&&s.performanceRevision===2?s.threadId:null;
+ async start(){await mkdir(this.dataDir,{recursive:true});this.defaultPrompt=await readFile(join(this.root,'assets','system-prompt.txt'),'utf8');const {settings:s,migration}=await readPromptSettings(join(this.dataDir,'settings.json'),this.defaultPrompt);for(const k of settingsKeys)if(s[k]!==undefined)this.state[k]=s[k];if(!s.defaultsRevision){this.state.inputMode='wispr';this.state.spokenReplies=false;}if(!s.lunaRevision){this.state.model='gpt-6-luna';this.state.effort='low';}this.state.prompt=migration.prompt;this.messages=(s.messages??[]).filter(m=>m&&typeof m.text==='string').slice(-120);for(const m of this.messages)this.emit('message',m);this.savedThread=s.promptVersion===4&&s.performanceRevision===2?s.threadId:null;
   try{this.state.excludedApps=excludedApps(this.state.excludedApps);}catch{this.privacyConfigurationError='Saved app exclusions are invalid; save valid private apps in Settings before sharing your screen';this.state.excludedApps=[];}
   this.state.noticeFeedback=Array.isArray(this.state.noticeFeedback)?this.state.noticeFeedback.filter(f=>f&&['useful','dismiss'].includes(f.value)&&typeof f.text==='string'&&Number.isFinite(f.at)).slice(-150):[];
   this.state.noticeSnoozeUntil=Number.isFinite(this.state.noticeSnoozeUntil)?Math.max(0,this.state.noticeSnoozeUntil):0;
   this.state.backgroundInterval=Math.max(10000,Math.min(600000,Number(this.state.backgroundInterval)||20000));
   this.lastNoticeAt=this.messages.filter(m=>m.source==='noticed').at(-1)?.at??0;
+  if(migration.migrated)await this.save();
   this.ledger=new TokenLedger(this.dataDir);this.publish({tokens:await this.ledger.load()});this.historyImport=this.ledger.importHistory(join(homedir(),'.codex')).then(tokens=>this.publish({tokens})).catch(e=>this.publish({tokenImportError:e.message}));
   await this.startBridge();if(this.state.inputMode==='always')this.startSpeech().catch(e=>this.publish({speech:'error',error:e.message}));try{await this.connect();}catch(e){this.publish({error:e.message});this.scheduleReconnect();}this.screenTimer=setInterval(()=>this.sample().catch(e=>this.publish({screenError:e.message})),750);this.visionTimer=setInterval(()=>this.watch().catch(()=>{}),1000);this.usageTimer=setInterval(()=>this.updateUsage().catch(()=>{}),60000);await this.sample();return this.state;}
  activityEvent(event){const index=this.activities.findIndex(e=>e.id===event.id);const item={at:Date.now(),...event};if(index>=0)this.activities[index]={...this.activities[index],...item};else this.activities.push(item);this.activities=this.activities.slice(-150);this.emit('activity',item);}
@@ -52,7 +56,10 @@ export class Companion extends EventEmitter{
    const text=result.text?.trim();if(!text)return;const normalize=s=>s.toLowerCase().replace(/[^a-z0-9 ]/g,'').replace(/\s+/g,' ').trim();const heard=normalize(text);
    const echo=this.spokenHistory.some(s=>Date.now()-s.at<10000&&heard.length>8&&(normalize(s.text).includes(heard)||heard.includes(normalize(s.text))));
    if(echo){this.publish({voiceActivity:'Playback echo rejected'});return;}
-   this.publish({lastRecognitionMs:result.elapsedMs});this.submit(text,{source:'voice'}).catch(e=>this.publish({error:e.message}));
+   this.publish({lastRecognitionMs:result.elapsedMs});const startedAt=Date.now();this.submit(text,{source:'voice'}).catch(async error=>{
+    let message=error.message;try{await preserveFailedVoiceInput(this,{text,source:'voice',error,startedAt});}catch(saveError){message+=' The recognized text could not be saved: '+saveError.message;}
+    this.publish({error:message});this.emit('voiceInputFailed');
+   });
   }finally{this.transcribing=false;this.publish({hearing:false});const next=this.voiceAudioQueue?.shift();if(next)setImmediate(()=>this.transcribe(next).catch(e=>this.publish({error:e.message})));}
  }
  scheduleReconnect(){if(this.closed||this.reconnectTimer)return;this.publish({connection:'reconnecting',busy:false,activity:'Reconnecting to Codex'});const delay=Math.min(30000,1500*2**(this.reconnectAttempts??0));this.reconnectAttempts=(this.reconnectAttempts??0)+1;this.reconnectTimer=setTimeout(async()=>{this.reconnectTimer=null;this.rpc?.removeAllListeners('disconnected');this.rpc?.close();try{await this.connect();this.reconnectAttempts=0;}catch(e){this.publish({error:e.message});this.scheduleReconnect();}},delay);}
@@ -87,9 +94,9 @@ export class Companion extends EventEmitter{
   this.publish({connection:'connected',plan:account.account.planType,models:this.models,activity:'Ready',error:null});
   await this.updateUsage();
  }
- async save(){const s={promptVersion:4,defaultsRevision:1,performanceRevision:2,lunaRevision:1,threadId:this.threadId,messages:this.messages};for(const k of settingsKeys)s[k]=this.state[k];this.saveQueue=(this.saveQueue??Promise.resolve()).catch(()=>{}).then(async()=>{const tmp=join(this.dataDir,'settings.tmp');await writeFile(tmp,JSON.stringify(s,null,2));await rename(tmp,join(this.dataDir,'settings.json'));});return this.saveQueue;}
+ async save(){const s={promptVersion:4,promptDefaultHash:defaultPromptHash(this.state.prompt,this.defaultPrompt),defaultsRevision:1,performanceRevision:2,lunaRevision:1,threadId:this.threadId??this.savedThread,messages:this.messages};for(const k of settingsKeys)s[k]=this.state[k];this.saveQueue=(this.saveQueue??Promise.resolve()).catch(()=>{}).then(async()=>{const tmp=join(this.dataDir,'settings.tmp');await writeFile(tmp,JSON.stringify(s,null,2));await rename(tmp,join(this.dataDir,'settings.json'));});return this.saveQueue;}
  async updateUsage(){if(this.state.connection!=='connected')return;const r=await this.rpc.call('account/rateLimits/read',{});this.publish({usage:r.rateLimits});}
- clearScreen(){this.frames=[];this.observations.clear();this.latest=null;this.attention=null;this.attentionPhysical=null;this.lastWatchFingerprint=null;this.emit('frame',null);this.emit('visionFrame',null);this.emit('annotation',{mark:{kind:'clear'}});}
+ clearScreen(){this.frames=[];this.observations.clear();this.modelObservations?.clear();this.lastModelObservationId=null;this.latest=null;this.attention=null;this.attentionPhysical=null;this.lastWatchFingerprint=null;this.emit('frame',null);this.emit('visionFrame',null);this.emit('annotation',{mark:{kind:'clear'}});}
  blockScreen(reason){this.clearScreen();this.publish({screenPrivacyBlocked:true,screenPrivacyReason:reason,screenWindow:null,captureSource:null,lastVisionAt:null});throw new PrivacyBlockedError(reason);}
  async assertScreenAllowed({mode='window',frame}={}){
   if(this.privacyConfigurationError)this.blockScreen(this.privacyConfigurationError);
@@ -119,7 +126,19 @@ export class Companion extends EventEmitter{
  async observe(region,options={}){const f=await this.captureSafely(region,options);this.latest=f;this.observations.set(f.id,f);if(this.observations.size>20)this.observations.delete(this.observations.keys().next().value);this.publish({lastVisionAt:Date.now()});this.emit('visionFrame',f);return f;}
  async safeObservation(region,options={}){return this.observe(region,options);}
  metadata(f){const p=this.attentionPhysical;const attention=p?{x:Math.round((p.x-f.bounds.x)*f.width/f.bounds.width),y:Math.round((p.y-f.bounds.y)*f.height/f.bounds.height),label:p.label}:this.attention??null;return {observationId:f.id,capturedAt:f.capturedAt,image:{width:f.width,height:f.height},pointer:f.cursor,window:f.window,attention};}
- frameContent(f){return [{type:'inputText',text:JSON.stringify(this.metadata(f))},{type:'inputImage',imageUrl:'data:image/jpeg;base64,'+f.image}];}
+ markModelObservation(f,{generation=this.generation}={}){
+  if(generation!==this.generation)throw new Error('The observation belongs to an interrupted request');
+  if(!f?.id||this.observations.get(f.id)!==f||!Number.isFinite(f.capturedAt))throw new Error('The model observation is no longer available');
+  this.modelObservations??=new Map();
+  for(const[id,entry]of this.modelObservations)if(entry.generation!==generation||this.observations.get(id)!==entry.frame)this.modelObservations.delete(id);
+  this.modelObservations.set(f.id,{generation,frame:f,observation:{id:f.id,capturedAt:f.capturedAt,window:{...f.window},captureSource:f.captureSource}});
+  this.lastModelObservationId=f.id;return f;
+ }
+ modelObservation(observationId){
+  const id=observationId===undefined?this.lastModelObservationId:observationId,entry=this.modelObservations?.get(id);
+  return entry&&entry.generation===this.generation&&this.observations.get(id)===entry.frame?entry.observation:null;
+ }
+ frameContent(f){this.markModelObservation(f);return [{type:'inputText',text:JSON.stringify(this.metadata(f))},{type:'inputImage',imageUrl:'data:image/jpeg;base64,'+f.image}];}
  observationContext(){const user=this.messages.filter(m=>m.role==='user').at(-1),reply=this.messages.filter(m=>m.role==='assistant'&&m.source!=='noticed').at(-1);return{lastUserMessage:user?{at:user.at,text:user.text.slice(0,1600)}:null,lastAssistantReply:reply?{at:reply.at,text:reply.text.slice(0,1600)}:null};}
  async watch(){
   const now=Date.now(),context=this.observationContext();
@@ -135,7 +154,7 @@ export class Companion extends EventEmitter{
  }
  assertModelAvailable(){if(this.state.connection!=='connected')throw new Error('Codex is reconnecting. Your input remains available to retry.');if(this.state.stopping||this.desktopActionsRevoked&&this.t3InFlight)throw new Error('The previous request has not stopped yet. Your message has not been sent.');if([this.state.usage?.primary,this.state.usage?.secondary].some(w=>w?.usedPercent>=100))throw new Error('Your included Codex allowance is used up. Wait for its reset.');}
  async submit(text,{source='text',onAccepted}={}){
-  text=String(text).trim().slice(0,16000);if(!text)return;
+  text=String(text);if(text.length>MAX_MESSAGE_LENGTH){const error=new RangeError(`Message exceeds the ${MAX_MESSAGE_LENGTH.toLocaleString('en-US')}-character limit (received ${text.length.toLocaleString('en-US')}). Shorten it and try again; nothing was sent.`);error.code='MESSAGE_TOO_LONG';error.limit=MAX_MESSAGE_LENGTH;error.length=text.length;throw error;}if(!text.trim())return;
   const fast=fastCommand(text),request=this.submitSequence=(this.submitSequence??0)+1;
   if(!fast)this.assertModelAvailable();
   if(fast&&!['stop','mute'].includes(fast.kind)){if(this.state.stopping||this.desktopActionsRevoked&&this.t3InFlight)throw new Error('The previous request has not stopped yet. Focus the Workspace to check its status');if(!this.state.control)throw new Error('App control is turned off');if(!this.state.running||!this.state.watching)throw new Error('Screen sharing is paused; resume it before controlling an app');}
@@ -179,13 +198,14 @@ export class Companion extends EventEmitter{
   if(this.state.connection!=='connected')throw new Error('Codex is reconnecting. Your input remains available to retry.');if([this.state.usage?.primary,this.state.usage?.secondary].some(w=>w?.usedPercent>=100)){this.publish({backgroundVision:false});throw new Error('Your included Codex allowance is used up. Wait for its reset.');}
   const turnModel=background?'gpt-6-luna':this.state.model,turnEffort=background?'low':this.state.effort;const token=++this.generation;this.background=background;this.actionCount=0;this.lastActionError=null;this.agentItems=new Map();this.turnId=null;this.turnStart=Date.now();this.firstReply=false;this.activeThreadId=this.threadId;
   this.publish({busy:true,background,activity:background?'Refreshing screen context':'Thinking'});if(!background)this.emit('responseStart',{generation:token});
-  const input=[{type:'text',text}];let finish,threadId=this.threadId;const completed=new Promise(resolve=>{finish=resolve;this.finishTurn=resolve;});
+  const input=[{type:'text',text}];let finish,threadId=this.threadId,modelFrame;const completed=new Promise(resolve=>{finish=resolve;this.finishTurn=resolve;});
   try{
    if(background){const r=await this.rpc.call('thread/start',{...this.threadParams(),model:turnModel,ephemeral:true},30000);threadId=r.thread.id;if(token!==this.generation)return;this.activeThreadId=threadId;}
    const captureStart=Date.now();
-   if(this.state.watching){try{const f=await this.observe(null,{maxWidth:background?1600:2560});input.push({type:'text',text:JSON.stringify({event:'screen_observation',...this.metadata(f)})},{type:'image',url:'data:image/jpeg;base64,'+f.image});}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED')throw e;if(background)return;input.push({type:'text',text:JSON.stringify({event:'screen_privacy',blocked:true,reason:e.message,scope:'Hephaestus screen sharing only; continue with this text request'})});}}
+   if(this.state.watching){try{const f=await this.observe(null,{maxWidth:background?1600:2560});modelFrame=f;input.push({type:'text',text:JSON.stringify({event:'screen_observation',...this.metadata(f)})},{type:'image',url:'data:image/jpeg;base64,'+f.image});}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED')throw e;if(background)return;input.push({type:'text',text:JSON.stringify({event:'screen_privacy',blocked:true,reason:e.message,scope:'Hephaestus screen sharing only; continue with this text request'})});}}
    if(token!==this.generation)return;this.publish({captureMs:Date.now()-captureStart});
    this.ledger?.setContext(threadId,{model:turnModel,purpose:this.dataDir.includes('verification')?'verification':background?'screen refresh':'conversation',request:background?text:this.messages.filter(m=>m.role==='user').at(-1)?.text??text,source:'live',startedAt:this.turnStart});
+   if(modelFrame)this.markModelObservation(modelFrame,{generation:token});
    const pending=this.rpc.call('turn/start',{threadId,input,model:turnModel,effort:turnEffort,summary:'auto',serviceTierForTurn:'default'},60000);this.starting=pending;const r=await pending;if(this.starting===pending)this.starting=null;
    if(token!==this.generation){this.ignoredTurns??=new Set();this.ignoredTurns.add(r.turn.id);await this.rpc.call('turn/interrupt',{threadId,turnId:r.turn.id}).catch(()=>{});throw new Error('Request interrupted');}this.turnId=r.turn.id;onAccepted?.();
    const timeout=setTimeout(()=>{if(token===this.generation){this.interrupt().catch(()=>{});this.publish({error:'The response timed out. Please try again.'});}finish();},90000);await completed;clearTimeout(timeout);
@@ -221,9 +241,9 @@ export class Companion extends EventEmitter{
    if(tool==='screen_windows'){const windows=await this.bridge.call('windows');if(token!==this.generation)throw new Error('Interrupted');reply(JSON.stringify(windows.filter(w=>!excludedProcess(w,this.state.excludedApps))));return;}
    if(tool==='companion_notice'){
     const text=String(a.text??'').trim().slice(0,1500);if(!text)throw new Error('Enter a notice');
-    const notice={...a,text},evaluate=()=>evaluateNotice({notice,context:this.observationContext(),recentNotices:this.messages.filter(m=>m.source==='noticed'),feedback:this.state.noticeFeedback,enabled:!this.background||this.state.proactive,snoozeUntil:this.background?this.state.noticeSnoozeUntil:0,lastNoticeAt:this.background?this.lastNoticeAt:0,observation:this.latest,background:this.background});let result=evaluate();
+    const notice={...a,text},evaluate=()=>evaluateNotice({notice,context:this.observationContext(),recentNotices:this.messages.filter(m=>m.source==='noticed'),feedback:this.state.noticeFeedback,enabled:!this.background||this.state.proactive,snoozeUntil:this.background?this.state.noticeSnoozeUntil:0,lastNoticeAt:this.background?this.lastNoticeAt:0,observation:this.modelObservation(a.observationId),background:this.background});let result=evaluate();
     if(result.status==='suppressed'){reply(JSON.stringify(result));return;}
-    if(this.background){if(!this.state.watching){reply(JSON.stringify({status:'suppressed',reason:'screen-paused',retry:false}));return;}try{await this.assertScreenAllowed({mode:this.state.captureMode,frame:this.latest});}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED')throw e;reply(JSON.stringify({status:'suppressed',reason:'screen-private',retry:false}));return;}if(token!==this.generation)throw new Error('Interrupted');result=evaluate();}
+    if(this.background){if(!this.state.watching){reply(JSON.stringify({status:'suppressed',reason:'screen-paused',retry:false}));return;}try{await this.assertScreenAllowed({mode:this.state.captureMode,frame:this.modelObservation(a.observationId)});}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED')throw e;reply(JSON.stringify({status:'suppressed',reason:'screen-private',retry:false}));return;}if(token!==this.generation)throw new Error('Interrupted');result=evaluate();}
     if(result.status==='suppressed'){reply(JSON.stringify(result));return;}
     this.lastNoticeAt=Date.now();const message=this.message('assistant',text,{source:'noticed',notice});if(this.state.spokenReplies)this.emit('speak',text);reply(JSON.stringify({...result,id:message.id}));return;
    }

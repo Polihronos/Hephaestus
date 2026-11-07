@@ -60,9 +60,12 @@ export async function qualityCheck({ dashboard, mascot, bubble, companion: c, ro
       await snapshot(`dashboard-${width}.png`);
       const collapse=await dashboard.webContents.executeJavaScript(`(()=>{
         const card=document.querySelector('.conversation-card'),button=document.querySelector('#toggle-screen'),before=card.getBoundingClientRect().width;
-        button.click();return {before,expanded:button.getAttribute('aria-expanded'),after:card.getBoundingClientRect().width};
+        button.click();const bounds=element=>{const r=element.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,visible:r.width>0&&r.height>0&&r.left>=0&&r.top>=0&&r.right<=innerWidth+1&&r.bottom<=innerHeight+1};};
+        return {before,expanded:button.getAttribute('aria-expanded'),after:card.getBoundingClientRect().width,send:bounds(document.querySelector('#send')),toggle:bounds(button),composer:bounds(document.querySelector('#dashboard-input')),overflow:document.documentElement.scrollWidth>innerWidth+1};
       })()`);
       check(`Conversation can take full width at ${width}×${height}`,collapse.expanded==='false'&&collapse.after>collapse.before*1.2);
+      check(`Expanded conversation controls stay inside ${width}×${height}`,!collapse.overflow&&collapse.send.visible&&collapse.toggle.visible&&collapse.composer.visible);
+      report['expandedLayout'+width]=collapse;
       await snapshot(`conversation-full-${width}.png`);
       await dashboard.webContents.executeJavaScript(`document.querySelector('#toggle-screen').click()`);
     }
@@ -77,13 +80,18 @@ export async function qualityCheck({ dashboard, mascot, bubble, companion: c, ro
     check('Sharing paused clears both screen previews', await dashboard.webContents.executeJavaScript(`document.querySelector('#screen-preview').hidden&&!document.querySelector('#large-preview')?.getAttribute('src')`));
     await showDashboard('screen');
     await dashboard.webContents.executeJavaScript(`(()=>{const e=document.querySelector('#excluded-apps');e.value='invalid/path.exe';e.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#save-privacy').click();})()`);
-    await until(()=>dashboard.webContents.executeJavaScript(`!document.querySelector('#notice').hidden`),3000,'Invalid privacy input did not surface an error');
-    check('Settings failures preserve input and offer a dismissible error',await dashboard.webContents.executeJavaScript(`document.querySelector('#excluded-apps').value==='invalid/path.exe'&&!document.querySelector('#notice-dismiss').hidden`));
+    await until(()=>dashboard.webContents.executeJavaScript(`document.querySelector('#excluded-apps').getAttribute('aria-invalid')==='true'`),3000,'Invalid privacy input did not surface an inline error');
+    check('Settings failures preserve input and show plain guidance beside the field',await dashboard.webContents.executeJavaScript(`(()=>{const field=document.querySelector('#excluded-apps'),error=document.querySelector('#privacy-status'),r=error.getBoundingClientRect();return field.value==='invalid/path.exe'&&field.getAttribute('aria-describedby').includes('privacy-status')&&error.textContent.includes('process names')&&!error.textContent.includes('remote method')&&r.top>=0&&r.bottom<=innerHeight;})()`));
     await snapshot('settings-error.png');
-    await dashboard.webContents.executeJavaScript(`document.querySelector('#notice-dismiss').click()`);
-    check('Error dismissal works',await dashboard.webContents.executeJavaScript(`document.querySelector('#notice').hidden`));
-    await c.configure({excludedApps:[]});
+    await dashboard.webContents.executeJavaScript(`(()=>{const field=document.querySelector('#excluded-apps');field.value='';field.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#save-privacy').click();})()`);
+    await until(()=>dashboard.webContents.executeJavaScript(`document.querySelector('#privacy-status').textContent==='Private apps saved.'`),3000,'Corrected privacy settings were not saved');
+    check('Correcting the field clears its error',await dashboard.webContents.executeJavaScript(`!document.querySelector('#excluded-apps').hasAttribute('aria-invalid')`));
     await showDashboard('companion');
+    const messagesBeforeLong=c.messages.length,runsBeforeLong=c.t3Runs.size;
+    await dashboard.webContents.executeJavaScript(String.raw`(()=>{const input=document.querySelector('#dashboard-input');input.value='  '+'Я'.repeat(16001)+'\n';input.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#message-form').requestSubmit();})()`);
+    await until(()=>dashboard.webContents.executeJavaScript(`!document.querySelector('#notice').hidden&&/16,?000/.test(document.querySelector('#notice-message').textContent)`),3000,'Oversized input did not receive a readable error');
+    check('Oversized input remains intact and does not reach a model or transcript',c.messages.length===messagesBeforeLong&&c.t3Runs.size===runsBeforeLong&&await dashboard.webContents.executeJavaScript(String.raw`document.querySelector('#dashboard-input').value==='  '+'Я'.repeat(16001)+'\n'&&!document.querySelector('#notice-message').textContent.includes('remote method')`));
+    await dashboard.webContents.executeJavaScript(`(()=>{const input=document.querySelector('#dashboard-input');input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#notice-dismiss').click();})()`);
 
     if (!fast) {
       const records = [];
@@ -95,12 +103,13 @@ export async function qualityCheck({ dashboard, mascot, bubble, companion: c, ro
       await c.bridge.call('action', { kind: 'focus', query: target });
       await c.configure({ watching: true });
 
+      const runsBefore=c.t3Runs.size;
       for (let i = 0; i < 30; i++) {
         const started = Date.now();
         await c.submit(i % 2 ? 'Scroll up' : 'Scroll down');
         report.localCommands.push(Date.now() - started);
       }
-      check('Thirty local commands complete without model requests', c.messages.filter(m => m.source === 'local').length >= 30 && report.localCommands.length === 30);
+      check('Thirty local commands complete without model requests', c.t3Runs.size===runsBefore&&c.messages.filter(m => m.source === 'local').length >= 30 && report.localCommands.length === 30);
       report.localLatency = distribution(report.localCommands);
 
       const prompts = [

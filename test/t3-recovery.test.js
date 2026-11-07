@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { T3Companion } from '../src/t3-companion.js';
 import { T3Client } from '../src/t3-client.js';
+import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
 
 function companion() {
   const c = new T3Companion({ root: process.cwd(), dataDir: process.cwd() });
@@ -186,3 +189,51 @@ test('events from a stopped request cannot speak into a newer reply', () => {
   assert.equal(spoken, 0);
   assert.equal(c.messages.length, 0);
 });
+
+async function promptFixture(run){
+  const dir=await mkdtemp(join(tmpdir(),'hephaestus-instructions-'));
+  try{await mkdir(join(dir,'context'));await writeFile(join(dir,'context','AGENTS.md'),'Previous instructions.\n');const c=companion();c.dataDir=dir;c.t3ThreadId='old';c.t3ProjectId='project';c.state.prompt='Previous instructions.';await run(c,dir);}finally{await rm(dir,{recursive:true,force:true});}
+}
+
+test('instruction save waits for confirmed cancellation before changing files or subscriptions',async()=>promptFixture(async(c,dir)=>{
+  let stoppedSubscriptions=0,launches=0;c.stopT3Subscription=()=>stoppedSubscriptions++;
+  c.interrupt=async()=>{c.state.stopping=true;c.t3InFlight=true;return{confirmed:false};};
+  c.t3={call:async()=>{launches++;return{threadId:'new'};}};
+  await assert.rejects(c.replacePrompt('New instructions.'),/still stopping/);
+  assert.equal(await readFile(join(dir,'context','AGENTS.md'),'utf8'),'Previous instructions.\n');
+  assert.equal(c.t3ThreadId,'old');assert.equal(stoppedSubscriptions,0);assert.equal(launches,0);
+}));
+
+test('delayed cancellation can be followed by instruction save and another successful request',async()=>promptFixture(async(c,dir)=>{
+  let confirmed=false;
+  c.interrupt=async()=>{c.state.stopping=!confirmed;c.t3InFlight=!confirmed;return{confirmed};};
+  c.t3={subscribe:()=>()=>{},call:async(tag,p)=>{if(tag==='orchestration.launchThread')return{threadId:'new'};if(p.type==='message.dispatch')queueMicrotask(()=>c.t3Finish?.());return{};}};
+  await assert.rejects(c.replacePrompt('New instructions.'),/still stopping/);
+  confirmed=true;await c.replacePrompt('New instructions.');
+  assert.equal(await readFile(join(dir,'context','AGENTS.md'),'utf8'),'New instructions.\n');
+  assert.equal(c.t3ThreadId,'new');assert.equal(c.state.stopping,false);
+  let accepted=false;await c.turn('Next request',{onAccepted:()=>{accepted=true;}});assert.equal(accepted,true);
+}));
+
+test('a failed replacement launch keeps the existing instructions and subscription',async()=>promptFixture(async(c,dir)=>{
+  let unsubscribed=false;c.stopT3Subscription=()=>{unsubscribed=true;};c.interrupt=async()=>({confirmed:true});
+  c.t3={call:async()=>{throw new Error('Launch unavailable');}};
+  await assert.rejects(c.replacePrompt('New instructions.'),/Launch unavailable/);
+  assert.equal(await readFile(join(dir,'context','AGENTS.md'),'utf8'),'Previous instructions.\n');
+  assert.equal(c.t3ThreadId,'old');assert.equal(unsubscribed,false);
+}));
+
+test('an unsuccessful prompt-file write preserves the active thread and original text',async()=>promptFixture(async(c,dir)=>{
+  await mkdir(join(dir,'context','AGENTS.md.tmp'));let archived;
+  c.interrupt=async()=>({confirmed:true});c.t3={call:async(tag,p)=>{if(tag==='orchestration.launchThread')return{threadId:'new'};archived=p.threadId;return{};}};
+  await assert.rejects(c.replacePrompt('New instructions.'));
+  assert.equal(await readFile(join(dir,'context','AGENTS.md'),'utf8'),'Previous instructions.\n');
+  assert.equal(c.t3ThreadId,'old');assert.equal(archived,'new');
+}));
+
+test('archiving failure does not misreport successfully activated instructions as unsaved',async()=>promptFixture(async(c,dir)=>{
+  c.interrupt=async()=>({confirmed:true});c.t3={subscribe:()=>()=>{},call:async(tag,p)=>{if(tag==='orchestration.launchThread')return{threadId:'new'};if(p.type==='thread.archive')throw new Error('Archive unavailable');return{};}};
+  await c.replacePrompt('New instructions.');
+  assert.equal(await readFile(join(dir,'context','AGENTS.md'),'utf8'),'New instructions.\n');assert.equal(c.t3ThreadId,'new');
+  assert.equal(c.activities.at(-1).title,'Conversation history');assert.equal(c.activities.at(-1).status,'failed');
+}));

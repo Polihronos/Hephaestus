@@ -17,6 +17,7 @@ New-Item -ItemType Directory -Path (Join-Path $appRoot 'native\bin') -Force | Ou
 Copy-Item -LiteralPath (Join-Path $projectRoot 'native\bin\release') -Destination (Join-Path $appRoot 'native\bin') -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'package.json') -Destination $appRoot -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md') -Destination $appRoot -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $appRoot -Force
 $codexPath=(Get-Command codex -ErrorAction Stop).Source
 $runtimeJson=@{codexPath=$codexPath} | ConvertTo-Json
 [IO.File]::WriteAllText((Join-Path $appRoot 'runtime-config.json'),$runtimeJson,(New-Object Text.UTF8Encoding($false)))

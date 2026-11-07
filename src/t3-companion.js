@@ -1,7 +1,7 @@
 import {Companion,dynamicTools} from './companion.js';
 import {T3Client} from './t3-client.js';
 import {startDesktopServer} from './desktop-server.js';
-import {mkdir,readFile,writeFile} from 'node:fs/promises';
+import {mkdir,readFile,writeFile,rename,unlink} from 'node:fs/promises';
 import {join} from 'node:path';
 import {homedir} from 'node:os';
 import {randomUUID} from 'node:crypto';
@@ -52,7 +52,11 @@ export class T3Companion extends Companion {
   const bridge=join(this.root,'src','desktop-mcp.js');await writeFile(join(cwd,'.codex','config.toml'),`[mcp_servers.hephaestus]\ncommand = "node"\nargs = [${JSON.stringify(bridge.replaceAll('\\','/'))}, ${JSON.stringify(join(this.dataDir,'desktop-bridge.json').replaceAll('\\','/'))}]\nstartup_timeout_sec = 10\ntool_timeout_sec = 60\n`);
   const config=join(homedir(),'.codex','config.toml');let text=await readFile(config,'utf8');const key=JSON.stringify(cwd.replaceAll('\\','/'));if(!text.includes(`[projects.${key}]`)){text+=`\n[projects.${key}]\ntrust_level = "trusted"\n`;await writeFile(config,text);}
  }
- async saveT3(){await writeFile(join(this.dataDir,'t3-runtime.json'),JSON.stringify({version:1,adapterVersion:this.desktopToolVersion??5,projectId:this.t3ProjectId,threadId:this.t3ThreadId},null,2));}
+ async saveT3(){
+  const data=JSON.stringify({version:1,adapterVersion:this.desktopToolVersion??5,projectId:this.t3ProjectId,threadId:this.t3ThreadId},null,2);
+  this.t3SaveQueue=(this.t3SaveQueue??Promise.resolve()).catch(()=>{}).then(async()=>{const file=join(this.dataDir,'t3-runtime.json');await writeFile(file+'.tmp',data);await rename(file+'.tmp',file);});
+  return this.t3SaveQueue;
+ }
  async reloadDesktopTools(projection){
   const p=projection??await this.t3.call('orchestration.getThreadProjection',{threadId:this.t3ThreadId});
   if(p.thread?.activeRunId||(p.runs??[]).some(r=>!terminal.has(r.status)))throw new Error('The conversation is still working. Tool updates will apply after it finishes.');
@@ -131,11 +135,12 @@ export class T3Companion extends Companion {
   this.publish({busy:true,background:false,activity:'Thinking'});this.emit('responseStart',{generation});
   let timer;const done=new Promise(resolve=>{this.t3Finish=resolve;timer=setTimeout(()=>{this.publish({error:'T3 is taking longer than expected. You can stop the request.'});},90000);});
   try{
-   let attachments=[],screenText='';if(this.state.watching){
+   let attachments=[],screenText='',sentObservation;if(this.state.watching){
     let f;const captureStarted=Date.now();try{f=await this.observe();}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED')throw e;screenText='\n\nScreen sharing is blocked for the active application by the user’s privacy settings. Continue with text and the existing conversation; do not capture that application through other tools.';}timings.captureMs=Date.now()-captureStarted;
-    if(f){const attachmentStarted=Date.now();const result=await this.t3.call('assets.persistChatAttachments',{threadId:this.t3ThreadId,messageId:this.t3MessageId,attachments:[{type:'image',name:'screen-observation.jpg',mimeType:'image/jpeg',sizeBytes:Buffer.from(f.image,'base64').length,dataUrl:'data:image/jpeg;base64,'+f.image}]});timings.attachmentMs=Date.now()-attachmentStarted;attachments=result.attachments;screenText='\n\n<screen_observation>\n'+JSON.stringify(this.metadata(f))+'\n</screen_observation>';}
+    if(f){const attachmentStarted=Date.now();const result=await this.t3.call('assets.persistChatAttachments',{threadId:this.t3ThreadId,messageId:this.t3MessageId,attachments:[{type:'image',name:'screen-observation.jpg',mimeType:'image/jpeg',sizeBytes:Buffer.from(f.image,'base64').length,dataUrl:'data:image/jpeg;base64,'+f.image}]});timings.attachmentMs=Date.now()-attachmentStarted;attachments=result.attachments;sentObservation=f;screenText='\n\n<screen_observation>\n'+JSON.stringify(this.metadata(f))+'\n</screen_observation>';}
    }
    if(generation!==this.generation)throw new Error('Request cancelled before it was sent.');
+   if(sentObservation)this.markModelObservation(sentObservation,{generation});
    const notices=this.messages.filter(m=>m.source==='noticed').slice(-3).map(m=>({at:m.at,text:m.text})),noticeContext=notices.length?'\n\n<recent_companion_observations>\n'+JSON.stringify(notices)+'\n</recent_companion_observations>':'';
    let history='';if(!this.hasT3History){history='<previous_conversation>\n'+this.messages.filter(m=>['user','assistant'].includes(m.role)&&m.delivery!=='failed').slice(-21,-1).map(m=>m.role+': '+m.text).join('\n')+'\n</previous_conversation>\n\n';}
    const runtimeText='\n\n<companion_runtime>\n'+JSON.stringify(this.runtimeContext())+'\n</companion_runtime>';
@@ -182,7 +187,35 @@ export class T3Companion extends Companion {
   }
   return super.interrupt();
  }
- async replacePrompt(prompt){await this.interrupt();await writeFile(join(this.dataDir,'context','AGENTS.md'),prompt+'\n');if(this.t3){const old=this.t3ThreadId;const r=await this.t3.call('orchestration.launchThread',{commandId:randomUUID(),projectId:this.t3ProjectId,title:'Hephaestus',modelSelection:this.modelSelection(),runtimeMode:'full-access',interactionMode:'default',workspaceStrategy:{type:'root'}});this.stopT3Subscription?.();this.t3ThreadId=r.threadId;this.hasT3History=false;this.stopT3Subscription=this.t3.subscribe('orchestration.subscribeThread',{threadId:this.t3ThreadId},item=>this.t3Stream(item));await this.saveT3();this.publish({t3ThreadId:this.t3ThreadId});await this.t3.call('orchestration.dispatchCommand',{type:'thread.archive',commandId:randomUUID(),threadId:old});}}
+ async replacePrompt(prompt){
+  if(this.updatingPrompt)throw new Error('Instructions are already being saved.');
+  this.updatingPrompt=true;
+  try{
+   const stopped=await this.interrupt();
+   if(stopped?.confirmed===false||this.state.stopping||this.t3InFlight)throw new Error('Your current request is still stopping. Wait for it to finish, then save your instructions again.');
+   if(!this.t3)throw new Error('The connection is recovering. Your instructions have not been changed.');
+   const path=join(this.dataDir,'context','AGENTS.md'),oldThread=this.t3ThreadId,oldHistory=this.hasT3History;
+   let previous;try{previous=await readFile(path,'utf8');}catch(e){if(e.code!=='ENOENT')throw e;}
+   const created=await this.t3.call('orchestration.launchThread',{commandId:randomUUID(),projectId:this.t3ProjectId,title:'Hephaestus',modelSelection:this.modelSelection(),runtimeMode:'full-access',interactionMode:'default',workspaceStrategy:{type:'root'}});
+   let switched=false,promptWritten=false;
+   try{
+    await writeFile(path+'.tmp',prompt+'\n');await rename(path+'.tmp',path);promptWritten=true;
+    this.stopT3Subscription?.();this.t3ThreadId=created.threadId;this.hasT3History=false;switched=true;
+    this.stopT3Subscription=this.t3.subscribe('orchestration.subscribeThread',{threadId:this.t3ThreadId},item=>this.t3Stream(item));
+    await this.saveT3();
+   }catch(error){
+    if(switched){this.stopT3Subscription?.();this.t3ThreadId=oldThread;this.hasT3History=oldHistory;this.stopT3Subscription=this.t3.subscribe('orchestration.subscribeThread',{threadId:oldThread},item=>this.t3Stream(item));}
+    if(promptWritten){if(previous!==undefined){await writeFile(path+'.tmp',previous);await rename(path+'.tmp',path);}else await unlink(path).catch(e=>{if(e.code!=='ENOENT')throw e;});}
+    await unlink(path+'.tmp').catch(()=>{});
+    await this.t3.call('orchestration.dispatchCommand',{type:'thread.archive',commandId:randomUUID(),threadId:created.threadId}).catch(()=>{});
+    throw error;
+   }
+   this.publish({t3ThreadId:this.t3ThreadId,busy:false,stopping:false,activity:'Ready'});
+   await this.t3.call('orchestration.dispatchCommand',{type:'thread.archive',commandId:randomUUID(),threadId:oldThread}).catch(error=>{
+    this.activityEvent({id:randomUUID(),kind:'tool',title:'Conversation history',status:'failed',text:'Instructions were saved. The previous conversation could not be archived: '+error.message});
+   });
+  }finally{this.updatingPrompt=false;}
+ }
  async close(){
   this.workspace?.close();
   try{await this.interrupt();}catch{/* Local actions were revoked even when remote cancellation is unavailable. */}

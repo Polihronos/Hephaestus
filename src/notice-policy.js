@@ -41,6 +41,7 @@ export function evaluateNotice({notice,context,recentNotices=[],feedback=[],enab
  if(!['problem','opportunity'].includes(notice.kind))return suppress('status-only');
  if(['rationale','benefit','action','task','evidence','subject'].some(key=>field(notice,key).length<8))return suppress('missing-actionable-evidence');
  const user=context?.lastUserMessage,currentUser=user&&Number.isFinite(user.at)&&now-user.at<=NOTICE_TASK_MAX_AGE;
+ // The caller resolves a retained image delivered to this turn, never a local preview.
  if(!observation||!Number.isFinite(observation.capturedAt)||now-observation.capturedAt>45000)return suppress('stale-observation');
  if(notice.observationId&&notice.observationId!==observation.id)return suppress('stale-observation');
  const taskTerms=new Set(noticeTerms(currentUser?user.text:notice.task)),claimTerms=new Set(noticeTerms(notice.task+' '+notice.rationale));

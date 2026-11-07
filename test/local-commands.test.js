@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {Companion} from '../src/companion.js';
+import {Companion,MAX_MESSAGE_LENGTH} from '../src/companion.js';
 import {fastCommand} from '../src/commands.js';
 
 function companion(){
@@ -86,4 +86,20 @@ test('core dispatch failures propagate and a pending start cannot hold Stop inde
  await assert.rejects(c.turn('Explain migrations',{onAccepted:()=>accepted++}),/Dispatch failed/);assert.equal(accepted,0);assert.equal(c.state.busy,false);
  let resolve;const cancelled=[];c.starting=new Promise(r=>resolve=r);c.rpc={call:async(method,args)=>cancelled.push([method,args.turnId])};
  await c.interrupt();assert.deepEqual(cancelled,[]);resolve({turn:{id:'late'}});await new Promise(r=>setImmediate(r));assert.deepEqual(cancelled,[['turn/interrupt','late']]);
+});
+
+test('messages at the supported limit are delivered completely, including non-English text and whitespace',async()=>{
+ for(const text of['a'.repeat(MAX_MESSAGE_LENGTH),' '+ 'Б'.repeat(MAX_MESSAGE_LENGTH-2)+'\n','😀'.repeat(MAX_MESSAGE_LENGTH/2)]){
+  const f=companion();let dispatched,accepted=0;f.c.turn=async(input,{onAccepted})=>{dispatched=input;onAccepted();};
+  await f.c.submit(text,{source:'wispr',onAccepted:()=>accepted++});assert.equal(dispatched,text);assert.equal(f.c.messages[0].text,text);assert.equal(f.c.messages[0].delivery,'sent');assert.equal(accepted,1);assert.equal(f.actions.length,0);
+ }
+});
+
+test('oversized input is rejected visibly before recording, interruption, wakeup or dispatch',async()=>{
+ for(const text of['a'.repeat(MAX_MESSAGE_LENGTH+1),'Б'.repeat(MAX_MESSAGE_LENGTH+1),'😀'.repeat(MAX_MESSAGE_LENGTH/2)+'x','stop'+' '.repeat(MAX_MESSAGE_LENGTH-3)]){
+  const f=companion();Object.assign(f.c.state,{running:false,connection:'reconnecting'});f.c.submitSequence=7;f.c.generation=23;let interrupted=0,configured=0,accepted=0,recorded=0;
+  f.c.interrupt=async()=>interrupted++;f.c.configure=async()=>configured++;f.c.on('message',()=>recorded++);
+  await assert.rejects(f.c.submit(text,{source:'wispr',onAccepted:()=>accepted++}),error=>error.code==='MESSAGE_TOO_LONG'&&error.limit===MAX_MESSAGE_LENGTH&&error.length===MAX_MESSAGE_LENGTH+1&&/16,000.*16,001.*nothing was sent/.test(error.message));
+  assert.equal(f.c.messages.length,0);assert.equal(recorded,0);assert.equal(interrupted,0);assert.equal(configured,0);assert.equal(accepted,0);assert.equal(f.inferences,0);assert.equal(f.actions.length,0);assert.equal(f.c.submitSequence,7);assert.equal(f.c.generation,23);assert.equal(f.c.state.running,false);
+ }
 });
