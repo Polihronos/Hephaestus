@@ -13,7 +13,7 @@ let retryNotice = null, noticeSource = '', following = true, scrollFrame = 0, st
 let screenCollapsed = false;
 try { screenCollapsed = localStorage.getItem('hephaestus.screenPanel') === 'hidden'; } catch { /* The panel still works if local storage is unavailable. */ }
 const messages = new Map();
-const time = value => new Date(value).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+const time = value => value == null || !Number.isFinite(new Date(value).getTime()) ? 'Earlier' : new Date(value).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 
 function announce(text) { $('conversation-announcer').textContent = text; }
 function notice(error, {retry = null, title = 'Something needs attention', source = 'local'} = {}) {
@@ -192,7 +192,9 @@ function message(value, {restored = false} = {}) {
   let row = existing?.row;
   if (!row) {
     row = document.createElement('div'); row.dataset.messageId = value.id;
-    const next = [...$('answers').querySelectorAll('[data-message-id]')].find(candidate => new Date(messages.get(candidate.dataset.messageId)?.message.at).getTime() > new Date(value.at).getTime());
+  }
+  if (!old || old.at !== value.at) {
+    const next = [...$('answers').querySelectorAll('[data-message-id]')].find(candidate => candidate !== row && (messages.get(candidate.dataset.messageId)?.message.at ?? 0) > (value.at ?? 0));
     $('answers').insertBefore(row,next ?? $('reply-draft'));
   }
   row.className = 'answer ' + (value.role === 'user' ? 'user' : value.role === 'system' ? 'system' : 'assistant');

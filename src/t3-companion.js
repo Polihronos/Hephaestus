@@ -9,6 +9,7 @@ import {T3Workspace,t3Tools} from './t3-workspace.js';
 
 const cleanText=text=>(text??'').replace(/^<previous_conversation>[\s\S]*?<\/previous_conversation>\s*/,'').split(/<screen_observation>|<recent_companion_observations>|<companion_runtime>/)[0].trim();
 const terminal=new Set(['completed','failed','cancelled','interrupted','rolled_back']);
+const timestamp=(...values)=>{for(const value of values){if(value==null)continue;const at=Date.parse(value);if(Number.isFinite(at))return at;}return null;};
 export class T3Companion extends Companion {
  async connect(){
   const previous=this.t3;this.t3=null;this.workspace?.close();this.stopT3Subscription?.();await previous?.close();
@@ -83,15 +84,17 @@ export class T3Companion extends Companion {
   // Restore missing transcript items without replaying speech or opening old popups.
   for(const item of p.turnItems??[]){
    if(item.streaming||!['assistant_message','user_message'].includes(item.type))continue;
-   const existing=item.type==='user_message'?this.messages.find(m=>m.t3MessageId===item.messageId):null;
-   if(existing&&existing.delivery!=='sent'){existing.delivery='sent';delete existing.deliveryError;this.emit('messageUpdated',{...existing});}
-   if(item.type==='assistant_message'&&!this.messages.some(m=>m.providerItemId===item.id)){
-    this.messages.push({id:randomUUID(),role:'assistant',text:item.text??'',at:Date.parse(item.completedAt??item.createdAt)||Date.now(),providerItemId:item.id,turnId:item.runId});
-   }else if(item.type==='user_message'&&!this.messages.some(m=>m.t3MessageId===item.messageId)){
-    this.messages.push({id:randomUUID(),role:'user',text:cleanText(item.text),at:Date.parse(item.createdAt)||Date.now(),source:'workspace',t3MessageId:item.messageId});
-   }
+   const user=item.type==='user_message',remote=item.messageId?p.messages?.find(m=>m.id===item.messageId):null,run=this.t3Runs.get(item.runId);
+   const at=user?timestamp(remote?.createdAt,item.startedAt,item.createdAt,item.completedAt,run?.requestedAt,item.updatedAt):timestamp(item.completedAt,item.startedAt,item.createdAt,item.updatedAt);
+   const existing=this.messages.find(m=>m.providerItemId===item.id||(user&&item.messageId&&m.t3MessageId===item.messageId));
+   if(existing){
+    let changed=false;
+    if(user&&existing.delivery!=='sent'){existing.delivery='sent';delete existing.deliveryError;changed=true;}
+    if(at!==null&&existing.at!==at){existing.at=at;changed=true;}
+    if(changed)this.emit('messageUpdated',{...existing});
+   }else this.messages.push({id:randomUUID(),role:user?'user':'assistant',text:user?cleanText(item.text):item.text??'',at,providerItemId:item.id,...(user?{source:'workspace',t3MessageId:item.messageId}:{turnId:item.runId})});
   }
-  this.messages=this.messages.slice(-120);
+  this.messages.sort((a,b)=>(a.at??0)-(b.at??0));this.messages=this.messages.slice(-120);
   this.emit('messagesRestored',this.messages);
   for(const provider of p.providerThreads??[])this.providerUpdate(provider);
   for(const turn of p.providerTurns??[])this.providerTurnUpdate(turn);
@@ -152,7 +155,7 @@ export class T3Companion extends Companion {
    if(generation!==this.generation){await this.t3.call('orchestration.dispatchCommand',{type:'thread.stop',commandId:randomUUID(),threadId:this.t3ThreadId,reason:'Cancelled while sending'});throw new Error('Request cancelled while it was being sent.');}
    this.hasT3History=true;acknowledge();await done;
   }catch(e){if(accepted){await done;}else{this.publish({error:e.message});throw e;}}
-  finally{clearTimeout(timer);if(this.t3PendingAcceptance?.messageId===requestId)this.t3PendingAcceptance=null;if(this.t3MessageId===requestId){this.t3InFlight=false;this.t3Finish=null;this.turnId=null;this.activeThreadId=this.threadId;if(generation===this.generation)this.publish({busy:false,activity:'Ready',lastTotalMs:Date.now()-this.t3TurnStart,lastTimings:{...timings,firstTextMs:this.t3FirstText?this.state.lastReplyMs:null,totalMs:Date.now()-this.t3TurnStart}});}await this.ledger?.flush();}
+  finally{clearTimeout(timer);if(this.t3PendingAcceptance?.messageId===requestId)this.t3PendingAcceptance=null;if(this.t3MessageId===requestId){this.t3InFlight=false;this.t3Finish=null;this.turnId=null;this.activeThreadId=this.threadId;if(generation===this.generation)this.publish({busy:this.state.connection==='connected'?false:this.state.busy,activity:this.state.connection==='connected'?'Ready':this.state.activity,lastTotalMs:Date.now()-this.t3TurnStart,lastTimings:{...timings,firstTextMs:this.t3FirstText?this.state.lastReplyMs:null,totalMs:Date.now()-this.t3TurnStart}});}await this.ledger?.flush();}
  }
  async invokeDesktopTool(tool,args){
   if(![...dynamicTools,...t3Tools].some(t=>t.name===tool))throw new Error('Unknown Hephaestus tool');

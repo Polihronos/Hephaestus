@@ -72,6 +72,34 @@ test('final-only T3 replies reach speech exactly once', () => {
   assert.equal(flushes, 1);
 });
 
+test('recovered history uses canonical message time and repairs previously restored timestamps',()=>{
+ const c=companion(),sent='2026-11-07T10:00:00Z',answered='2026-11-07T10:00:05Z';
+ c.messages=[{id:'local',role:'user',text:'Question',at:Date.now(),t3MessageId:'user',delivery:'failed'}];
+ c.restoreProjection({messages:[{id:'user',createdAt:sent}],turnItems:[
+  {id:'u',type:'user_message',messageId:'user',text:'Question',startedAt:'2026-11-07T10:00:01Z'},
+  {id:'a',type:'assistant_message',text:'Answer',startedAt:'2026-11-07T10:00:02Z',completedAt:answered}
+ ]});
+ assert.deepEqual(c.messages.map(m=>[m.text,m.at]),[['Question',Date.parse(sent)],['Answer',Date.parse(answered)]]);
+ assert.equal(c.messages[0].id,'local');assert.equal(c.messages[0].delivery,'sent');
+});
+
+test('historical recovery retains the newest messages and most recent user context',()=>{
+ const c=companion(),start=Date.parse('2026-11-07T10:00:00Z');
+ c.messages=[{id:'recent',role:'user',text:'My current task',at:start+200000}];
+ const turnItems=Array.from({length:125},(_,i)=>({id:'u'+i,type:'user_message',messageId:'m'+i,text:'Earlier task '+i,startedAt:new Date(start+i*1000).toISOString()}));
+ c.restoreProjection({turnItems});c.restoreProjection({turnItems});
+ assert.equal(c.messages.length,120);assert.equal(c.messages.at(-1).id,'recent');assert.equal(c.messages[0].text,'Earlier task 6');
+ assert.equal(c.messages.filter(m=>m.id==='recent').length,1);
+});
+
+test('undated recovery never invents a new timestamp or matches an unrelated legacy user',()=>{
+ const c=companion();c.messages=[{id:'legacy',role:'user',text:'Existing task',at:123}];
+ const projection={turnItems:[{id:'undated',type:'user_message',text:'Undated history'}]};
+ c.restoreProjection(projection);c.restoreProjection(projection);
+ assert.equal(c.messages.length,2);assert.equal(c.messages[0].text,'Undated history');assert.equal(c.messages[0].at,null);
+ assert.equal(c.messages.at(-1).id,'legacy');assert.equal(c.messages.at(-1).delivery,undefined);
+});
+
 test('the final suffix is spoken without repeating already streamed text', () => {
   const c = companion();
   c.t3TurnStart = Date.now();
@@ -149,6 +177,15 @@ test('a privacy-blocked foreground app permits a text-only request', async () =>
   assert.equal(accepted, true);
   assert.deepEqual(request.attachments, []);
   assert.match(request.text, /privacy settings/);
+});
+
+test('losing the connection during a request keeps recovery status until the runtime reconciles it',async()=>{
+ const c=companion();
+ c.t3={call:async()=>{queueMicrotask(()=>{c.t3Finish?.();c.scheduleReconnect();clearTimeout(c.reconnectTimer);c.reconnectTimer=null;});return{};}};
+ await c.turn('Keep working');
+ assert.equal(c.state.activity,'Reconnecting to Codex');assert.equal(c.state.busy,true);
+ c.restoreProjection({thread:{activeRunId:'run'},runs:[{id:'run',status:'running',userMessageId:'user'}]});
+ assert.equal(c.t3InFlight,true);assert.equal(c.state.busy,true);assert.equal(c.state.activity,'Continuing your request');
 });
 
 test('a disconnected T3 call and subscription do not retain pending handles', async () => {
