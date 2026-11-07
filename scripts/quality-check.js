@@ -15,7 +15,8 @@ async function until(check, timeout = 15000, message = 'Condition was not met') 
 }
 function distribution(values) {
   const sorted = [...values].sort((a, b) => a - b);
-  return { samples: sorted.length, medianMs: sorted[Math.floor(sorted.length / 2)] ?? null,
+  const middle=Math.floor(sorted.length/2),median=sorted.length?sorted.length%2?sorted[middle]:(sorted[middle-1]+sorted[middle])/2:null;
+  return { samples: sorted.length, medianMs: median,
     p95Ms: sorted[Math.max(0, Math.ceil(sorted.length * .95) - 1)] ?? null };
 }
 

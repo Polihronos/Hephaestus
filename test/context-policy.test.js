@@ -131,20 +131,20 @@ async function submitNotice(c,args){
 }
 
 test('a notice uses its model-delivered observation despite intervening local previews',async()=>{
- const c=noticeCompanion(),delivered=await c.observe();c.frameContent(delivered);await c.sample();
+ const c=noticeCompanion(),delivered=await c.observe();c.shareModelObservation(delivered);await c.sample();
  assert.notEqual(c.latest.id,delivered.id);assert.equal(c.observations.get(delivered.id),delivered);
  const result=await submitNotice(c,{...notice,observationId:delivered.id});assert.equal(result.status,'shown');assert.equal(c.messages.at(-1).source,'noticed');
 });
 
 test('notice without an ID selects the last model-visible image rather than the newest preview',async()=>{
- const c=noticeCompanion(),delivered=await c.observe();c.frameContent(delivered);await c.sample();const{observationId,...withoutId}=notice;
+ const c=noticeCompanion(),delivered=await c.observe();c.shareModelObservation(delivered);await c.sample();const{observationId,...withoutId}=notice;
  assert.equal(c.modelObservation().id,delivered.id);assert.notEqual(c.modelObservation().id,c.latest.id);
  assert.equal((await submitNotice(c,withoutId)).status,'shown');
 });
 
 test('a fresh local preview never renews expired model evidence with or without an observation ID',async()=>{
  for(const includeId of[true,false]){
-  const c=noticeCompanion({capturedAt:Date.now()-60000}),expired=await c.observe();c.frameContent(expired);await c.sample();
+  const c=noticeCompanion({capturedAt:Date.now()-60000}),expired=await c.observe();c.shareModelObservation(expired);await c.sample();
   const{observationId,...withoutId}=notice;const args=includeId?{...notice,observationId:expired.id}:withoutId;
   assert.ok(Date.now()-c.latest.capturedAt<1000);assert.equal((await submitNotice(c,args)).reason,'stale-observation');assert.equal(c.messages.filter(m=>m.source==='noticed').length,0);
  }
@@ -152,7 +152,7 @@ test('a fresh local preview never renews expired model evidence with or without 
 
 test('unknown, preview-only and captured-but-undelivered IDs cannot justify a notice',async()=>{
  for(const source of['unknown','preview','unseen-observation']){
-  const c=noticeCompanion(),delivered=await c.observe();c.frameContent(delivered);await c.sample();
+  const c=noticeCompanion(),delivered=await c.observe();c.shareModelObservation(delivered);await c.sample();
   const id=source==='unknown'?'unknown':source==='preview'?c.latest.id:(await c.observe()).id;
   assert.equal((await submitNotice(c,{...notice,observationId:id})).reason,'stale-observation');
  }
@@ -162,7 +162,7 @@ test('unknown, preview-only and captured-but-undelivered IDs cannot justify a no
 
 test('previous-generation model images cannot support either explicit or implicit notice evidence',async()=>{
  for(const includeId of[true,false]){
-  const c=noticeCompanion(),delivered=await c.observe();c.frameContent(delivered);c.generation++;c.turnId='new-turn';await c.sample();
+  const c=noticeCompanion(),delivered=await c.observe();c.shareModelObservation(delivered);c.generation++;c.turnId='new-turn';await c.sample();
   const{observationId,...withoutId}=notice;assert.equal((await submitNotice(c,includeId?{...notice,observationId:delivered.id}:withoutId)).reason,'stale-observation');
  }
 });
@@ -176,15 +176,45 @@ test('model observation registration requires the retained frame and current gen
 });
 
 test('privacy clearing invalidates delivered-image evidence until another image is delivered',async()=>{
- const c=noticeCompanion(),delivered=await c.observe();c.frameContent(delivered);c.clearScreen();await c.sample();const{observationId,...withoutId}=notice;
+ const c=noticeCompanion(),delivered=await c.observe();c.shareModelObservation(delivered);c.clearScreen();await c.sample();const{observationId,...withoutId}=notice;
  assert.equal(c.modelObservation(),null);assert.equal((await submitNotice(c,withoutId)).reason,'stale-observation');
 });
 
-test('initial core turn image input is registered before dispatch and stays distinct from preview',async()=>{
- const c=noticeCompanion();let dispatched=false;
+test('initial core turn image becomes shared only after acceptance and stays distinct from preview',async()=>{
+ const c=noticeCompanion();let dispatched=false,observationId;
  c.rpc={call:async(method,params)=>{
   assert.equal(method,'turn/start');const metadata=JSON.parse(params.input.find(item=>item.type==='text'&&item.text.includes('screen_observation')).text);
-  assert.equal(c.modelObservation().id,metadata.observationId);await c.sample();assert.notEqual(c.latest.id,metadata.observationId);assert.equal(c.modelObservation().id,metadata.observationId);dispatched=true;setImmediate(()=>c.finishTurn?.());return{turn:{id:'model-turn'}};
+  observationId=metadata.observationId;assert.equal(c.modelObservation(),null);await c.sample();assert.notEqual(c.latest.id,metadata.observationId);dispatched=true;setImmediate(()=>c.finishTurn?.());return{turn:{id:'model-turn'}};
  }};
- await c.turn('Fix the Prisma migration');assert.equal(dispatched,true);
+ await c.turn('Fix the Prisma migration');assert.equal(dispatched,true);assert.equal(c.modelObservation().id,observationId);
+});
+
+test('capturing or building a payload never changes the last shared image',async()=>{
+ const c=noticeCompanion(),shared=[];c.on('visionFrame',frame=>shared.push(frame));
+ const first=await c.observe();assert.equal(c.state.lastVisionAt,undefined);assert.equal(shared.length,0);
+ c.shareModelObservation(first);const next=await c.observe();c.frameContent(next);
+ assert.deepEqual(shared,[first]);assert.equal(c.modelObservation().id,first.id);
+});
+
+test('failed direct transport leaves the prior shared image and evidence intact',async()=>{
+ const c=noticeCompanion(),first=await c.observe(),shared=[];c.shareModelObservation(first);c.on('visionFrame',frame=>shared.push(frame));
+ c.rpc={call:async()=>{throw new Error('Transport rejected the turn');}};
+ await assert.rejects(c.turn('Read this screen'),/Transport rejected/);
+ assert.equal(shared.length,0);assert.equal(c.modelObservations.has(first.id),true);
+ assert.equal(c.lastModelObservationId,first.id);
+});
+
+test('paused, excluded or interrupted delivery never restores a hidden shared image',async()=>{
+ for(const block of[c=>c.generation++,c=>c.state.watching=false,c=>c.state.excludedApps=['editor'],c=>c.clearScreen()]){
+  const c=noticeCompanion(),frame=await c.observe(),generation=c.generation,shared=[];block(c);c.on('visionFrame',frame=>shared.push(frame));
+  assert.equal(c.shareModelObservation(frame,{generation}),false);assert.equal(shared.length,0);assert.equal(c.modelObservation(frame.id),null);
+ }
+});
+
+test('tool images become shared only after their result reaches the reply transport',async()=>{
+ for(const fail of[false,true]){
+  const c=noticeCompanion(),shared=[];c.on('visionFrame',frame=>shared.push(frame));
+  await c.onTool({id:'observe',method:'item/tool/call',params:{threadId:c.threadId,turnId:c.turnId,tool:'screen_observe',arguments:{}}},{reply:()=>{assert.equal(shared.length,0);if(fail)throw new Error('Transport closed');}});
+  assert.equal(shared.length,fail?0:1);assert.equal(c.modelObservation()?.id??null,fail?null:shared[0].id);
+ }
 });

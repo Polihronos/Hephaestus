@@ -62,10 +62,10 @@ export class Companion extends EventEmitter{
    });
   }finally{this.transcribing=false;this.publish({hearing:false});const next=this.voiceAudioQueue?.shift();if(next)setImmediate(()=>this.transcribe(next).catch(e=>this.publish({error:e.message})));}
  }
- scheduleReconnect(){if(this.closed||this.reconnectTimer)return;this.publish({connection:'reconnecting',busy:!!this.t3InFlight&&this.state.busy,activity:'Reconnecting to Codex'});const delay=Math.min(30000,1500*2**(this.reconnectAttempts??0));this.reconnectAttempts=(this.reconnectAttempts??0)+1;this.reconnectTimer=setTimeout(async()=>{this.reconnectTimer=null;this.rpc?.removeAllListeners('disconnected');this.rpc?.close();try{await this.connect();this.reconnectAttempts=0;}catch(e){this.publish({error:e.message});this.scheduleReconnect();}},delay);}
+ scheduleReconnect(){if(this.closed||this.reconnectTimer)return;this.publish({connection:'reconnecting',busy:!!this.t3InFlight&&this.state.busy,activity:'Reconnecting to Codex'});const delay=Math.min(30000,1500*2**(this.reconnectAttempts??0));this.reconnectAttempts=(this.reconnectAttempts??0)+1;this.reconnectTimer=setTimeout(async()=>{this.reconnectTimer=null;if(this.closed)return;this.rpc?.removeAllListeners('disconnected');this.rpc?.close();try{await this.connect();if(!this.closed)this.reconnectAttempts=0;}catch(e){if(this.closed)return;this.publish({error:e.message});this.scheduleReconnect();}},delay);}
  threadParams(){return {cwd:join(this.dataDir,'context'),model:this.state.model,modelProvider:'openai',sandbox:'read-only',approvalPolicy:'never',baseInstructions:this.state.prompt,developerInstructions:'',config:{model_reasoning_effort:this.state.effort,model_reasoning_summary:'auto',project_doc_max_bytes:0},dynamicTools};}
  async openThread(){const p=this.threadParams();let r;if(this.savedThread){try{const {dynamicTools,...resume}=p;r=await this.rpc.call('thread/resume',{...resume,threadId:this.savedThread,excludeTurns:true},60000);}catch{}}if(!r){r=await this.rpc.call('thread/start',p,60000);const items=this.messages.filter(m=>['user','assistant'].includes(m.role)).slice(-40).map(m=>({type:'message',role:m.role,content:[{type:m.role==='user'?'input_text':'output_text',text:m.text}]}));if(items.length)await this.rpc.call('thread/inject_items',{threadId:r.thread.id,items});}this.threadId=r.thread.id;this.savedThread=this.threadId;await this.save();}
- async connect(){
+ async connect({publishReady=true}={}){
   if(this.closed)return;
   this.publish({connection:'connecting',activity:'Connecting to your Codex subscription',error:null});
   await mkdir(join(this.dataDir,'context'),{recursive:true});
@@ -91,8 +91,8 @@ export class Companion extends EventEmitter{
   this.models=catalog.data.filter(m=>!m.hidden).map(m=>({id:m.id,name:m.displayName,efforts:m.supportedReasoningEfforts?.map(e=>e.reasoningEffort)??['low']}));
   if(!this.models.some(m=>m.id==='gpt-6-luna'))throw new Error('Luna 6 is unavailable in your signed-in account. No more expensive model will be selected automatically.');if(!this.models.some(m=>m.id===this.state.model)){this.state.model='gpt-6-luna';this.state.effort='low';}
   await this.openThread();
-  this.publish({connection:'connected',plan:account.account.planType,models:this.models,activity:'Ready',error:null});
-  await this.updateUsage();
+  this.publish({plan:account.account.planType,models:this.models,...(publishReady?{connection:'connected',activity:'Ready',error:null}:{})});
+  if(publishReady)await this.updateUsage();
  }
  async save(){const s={promptVersion:4,promptDefaultHash:defaultPromptHash(this.state.prompt,this.defaultPrompt),defaultsRevision:1,performanceRevision:2,lunaRevision:1,threadId:this.threadId??this.savedThread,messages:this.messages};for(const k of settingsKeys)s[k]=this.state[k];this.saveQueue=(this.saveQueue??Promise.resolve()).catch(()=>{}).then(async()=>{const tmp=join(this.dataDir,'settings.tmp');await writeFile(tmp,JSON.stringify(s,null,2));await rename(tmp,join(this.dataDir,'settings.json'));});return this.saveQueue;}
  async updateUsage(){if(this.state.connection!=='connected')return;const r=await this.rpc.call('account/rateLimits/read',{});this.publish({usage:r.rateLimits});}
@@ -123,7 +123,7 @@ export class Companion extends EventEmitter{
   f.id=randomUUID();return f;
  }
  async sample(){if(this.sampling||!this.state.running||!this.state.watching)return;this.sampling=true;try{const f=await this.captureSafely();this.latest=f;this.frames=[f];this.publish({screenWindow:f.window.title,screenError:null,captureSource:f.captureSource});this.emit('frame',f);}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED'&&e.message!=='Screen capture was interrupted')throw e;}finally{this.sampling=false;}}
- async observe(region,options={}){const f=await this.captureSafely(region,options);this.latest=f;this.observations.set(f.id,f);if(this.observations.size>20)this.observations.delete(this.observations.keys().next().value);this.publish({lastVisionAt:Date.now()});this.emit('visionFrame',f);return f;}
+ async observe(region,options={}){const f=await this.captureSafely(region,options);this.latest=f;this.observations.set(f.id,f);if(this.observations.size>20)this.observations.delete(this.observations.keys().next().value);return f;}
  async safeObservation(region,options={}){return this.observe(region,options);}
  metadata(f){const p=this.attentionPhysical;const attention=p?{x:Math.round((p.x-f.bounds.x)*f.width/f.bounds.width),y:Math.round((p.y-f.bounds.y)*f.height/f.bounds.height),label:p.label}:this.attention??null;return {observationId:f.id,capturedAt:f.capturedAt,image:{width:f.width,height:f.height},pointer:f.cursor,window:f.window,attention};}
  markModelObservation(f,{generation=this.generation}={}){
@@ -138,7 +138,11 @@ export class Companion extends EventEmitter{
   const id=observationId===undefined?this.lastModelObservationId:observationId,entry=this.modelObservations?.get(id);
   return entry&&entry.generation===this.generation&&this.observations.get(id)===entry.frame?entry.observation:null;
  }
- frameContent(f){this.markModelObservation(f);return [{type:'inputText',text:JSON.stringify(this.metadata(f))},{type:'inputImage',imageUrl:'data:image/jpeg;base64,'+f.image}];}
+ shareModelObservation(f,{generation=this.generation}={}){
+  if(!f||generation!==this.generation||!this.state.running||!this.state.watching||this.state.screenPrivacyBlocked||this.privacyConfigurationError||this.observations.get(f.id)!==f||excludedProcess(f.window,this.state.excludedApps))return false;
+  this.markModelObservation(f,{generation});this.publish({lastVisionAt:Date.now()});this.emit('visionFrame',f);return true;
+ }
+ frameContent(f){return [{type:'inputText',text:JSON.stringify(this.metadata(f))},{type:'inputImage',imageUrl:'data:image/jpeg;base64,'+f.image}];}
  observationContext(){const user=this.messages.filter(m=>m.role==='user').at(-1),reply=this.messages.filter(m=>m.role==='assistant'&&m.source!=='noticed').at(-1);return{lastUserMessage:user?{at:user.at,text:user.text.slice(0,1600)}:null,lastAssistantReply:reply?{at:reply.at,text:reply.text.slice(0,1600)}:null};}
  async watch(){
   const now=Date.now(),context=this.observationContext();
@@ -205,9 +209,8 @@ export class Companion extends EventEmitter{
    if(this.state.watching){try{const f=await this.observe(null,{maxWidth:background?1600:2560});modelFrame=f;input.push({type:'text',text:JSON.stringify({event:'screen_observation',...this.metadata(f)})},{type:'image',url:'data:image/jpeg;base64,'+f.image});}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED')throw e;if(background)return;input.push({type:'text',text:JSON.stringify({event:'screen_privacy',blocked:true,reason:e.message,scope:'Hephaestus screen sharing only; continue with this text request'})});}}
    if(token!==this.generation)return;this.publish({captureMs:Date.now()-captureStart});
    this.ledger?.setContext(threadId,{model:turnModel,purpose:this.dataDir.includes('verification')?'verification':background?'screen refresh':'conversation',request:background?text:this.messages.filter(m=>m.role==='user').at(-1)?.text??text,source:'live',startedAt:this.turnStart});
-   if(modelFrame)this.markModelObservation(modelFrame,{generation:token});
    const pending=this.rpc.call('turn/start',{threadId,input,model:turnModel,effort:turnEffort,summary:'auto',serviceTierForTurn:'default'},60000);this.starting=pending;const r=await pending;if(this.starting===pending)this.starting=null;
-   if(token!==this.generation){this.ignoredTurns??=new Set();this.ignoredTurns.add(r.turn.id);await this.rpc.call('turn/interrupt',{threadId,turnId:r.turn.id}).catch(()=>{});throw new Error('Request interrupted');}this.turnId=r.turn.id;onAccepted?.();
+   if(token!==this.generation){this.ignoredTurns??=new Set();this.ignoredTurns.add(r.turn.id);await this.rpc.call('turn/interrupt',{threadId,turnId:r.turn.id}).catch(()=>{});throw new Error('Request interrupted');}this.turnId=r.turn.id;if(modelFrame)this.shareModelObservation(modelFrame,{generation:token});onAccepted?.();
    const timeout=setTimeout(()=>{if(token===this.generation){this.interrupt().catch(()=>{});this.publish({error:'The response timed out. Please try again.'});}finish();},90000);await completed;clearTimeout(timeout);
   }catch(e){if(token===this.generation){this.message('system',e.message);this.publish({error:e.message});}throw e;}
   finally{if(background&&threadId!==this.threadId)this.rpc.call('thread/unsubscribe',{threadId}).catch(()=>{});if(token===this.generation){this.turnId=null;this.finishTurn=null;this.publish({busy:false,background:false,lastTotalMs:Date.now()-this.turnStart,activity:'Ready'});}}
@@ -231,13 +234,13 @@ export class Companion extends EventEmitter{
  async onTool(m,rpc=this.rpc){
   const token=this.generation;
   const activityId='tool-'+(m.params?.callId??m.id),started=Date.now();
-  const reply=content=>{if(m.params.tool==='screen_action')this.lastActionError=null;this.activityEvent({id:activityId,kind:'tool',title:m.params.tool,status:'completed',durationMs:Date.now()-started});rpc.reply(m.id,{success:true,contentItems:typeof content==='string'?[{type:'inputText',text:content}]:content});};
+  const reply=(content,frame)=>{if(m.params.tool==='screen_action')this.lastActionError=null;this.activityEvent({id:activityId,kind:'tool',title:m.params.tool,status:'completed',durationMs:Date.now()-started});rpc.reply(m.id,{success:true,contentItems:typeof content==='string'?[{type:'inputText',text:content}]:content});if(frame)this.shareModelObservation(frame,{generation:token});};
   try{
    if(m.method!=='item/tool/call'){rpc.reply(m.id,{decision:'decline'});return;}
    if(m.params.threadId!==(this.activeThreadId??this.threadId)||!this.state.running||!this.state.busy||this.ignoredTurns?.has(m.params.turnId)||m.params.turnId!==this.turnId)throw new Error('This turn is no longer active');
    const tool=m.params.tool,a=typeof m.params.arguments==='string'?JSON.parse(m.params.arguments):m.params.arguments??{};
    this.activityEvent({id:activityId,kind:'tool',title:tool,status:'running',text:a.reason??'',background:this.background});
-   if(tool==='screen_observe'){const f=await this.observe(null,a);if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(f));return;}
+   if(tool==='screen_observe'){const f=await this.observe(null,a);if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(f),f);return;}
    if(tool==='screen_windows'){const windows=await this.bridge.call('windows');if(token!==this.generation)throw new Error('Interrupted');reply(JSON.stringify(windows.filter(w=>!excludedProcess(w,this.state.excludedApps))));return;}
    if(tool==='companion_notice'){
     const text=String(a.text??'').trim().slice(0,1500);if(!text)throw new Error('Enter a notice');
@@ -252,15 +255,15 @@ export class Companion extends EventEmitter{
    await this.assertScreenAllowed({mode:this.state.captureMode,frame:f});if(token!==this.generation||!this.state.watching)throw new Error('Interrupted');
    if(tool==='screen_zoom'){
     const p=framePoint(f,a.x,a.y),q=framePoint(f,a.x+a.width,a.y+a.height);if(a.width<16||a.height<16)throw new Error('Zoom region is too small');
-    const fresh=await this.observe({x:p.x,y:p.y,width:q.x-p.x,height:q.y-p.y});if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(fresh));return;
+    const fresh=await this.observe({x:p.x,y:p.y,width:q.x-p.x,height:q.y-p.y});if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(fresh),fresh);return;
    }
    if(tool==='screen_action'){
     if(this.background)throw new Error('Application control requires a user request');if(!this.state.control)throw new Error('App control is turned off');
     let actionFrame=f;const steps=a.kind==='sequence'?a.steps:[a];if(!Array.isArray(steps)||!steps.length||steps.length>6)throw new Error('Use between one and six actions');for(const step of steps){validateAction(step);if(a.kind==='sequence'&&['focus','browser'].includes(step.kind))throw new Error('A sequence must stay in the observed window');}if(a.needsConfirmation)await this.askConfirmation(a);if(token!==this.generation||!this.state.control)throw new Error('Interrupted');
-    if(a.focusTarget&&!['focus','browser'].includes(a.kind)){const current=await this.assertScreenAllowed({frame:f});if(token!==this.generation||!this.state.control)throw new Error('Interrupted');if(current.id!==f.window.id){await this.bridge.call('action',{kind:'focus',query:f.window.id});const fresh=await this.observe();if(fresh.window.id!==f.window.id||fresh.width!==f.width||fresh.height!==f.height||screenDifference(Buffer.from(fresh.fingerprint,'base64'),Buffer.from(f.fingerprint,'base64'))>8){this.lastActionError='The intended window changed; no input was sent. Use this fresh observation to retry.';this.activityEvent({id:activityId,kind:'tool',title:tool,status:'failed',text:this.lastActionError,durationMs:Date.now()-started});rpc.reply(m.id,{success:false,contentItems:[{type:'inputText',text:this.lastActionError},...this.frameContent(fresh)]});return;}actionFrame=fresh;}}
+    if(a.focusTarget&&!['focus','browser'].includes(a.kind)){const current=await this.assertScreenAllowed({frame:f});if(token!==this.generation||!this.state.control)throw new Error('Interrupted');if(current.id!==f.window.id){await this.bridge.call('action',{kind:'focus',query:f.window.id});const fresh=await this.observe();if(fresh.window.id!==f.window.id||fresh.width!==f.width||fresh.height!==f.height||screenDifference(Buffer.from(fresh.fingerprint,'base64'),Buffer.from(f.fingerprint,'base64'))>8){this.lastActionError='The intended window changed; no input was sent. Use this fresh observation to retry.';this.activityEvent({id:activityId,kind:'tool',title:tool,status:'failed',text:this.lastActionError,durationMs:Date.now()-started});rpc.reply(m.id,{success:false,contentItems:[{type:'inputText',text:this.lastActionError},...this.frameContent(fresh)]});this.shareModelObservation(fresh,{generation:token});return;}actionFrame=fresh;}}
     this.publish({activity:a.reason||`Using ${a.kind}`});this.emit('action',{kind:a.kind,reason:a.reason,at:Date.now()});
     for(const step of steps){await this.assertScreenAllowed({frame:actionFrame});if(token!==this.generation||!this.state.running||!this.state.watching||!this.state.control)throw new Error('Interrupted');if(step.kind==='browser')await this.focusBrowser({guard:()=>{if(token!==this.generation||!this.state.control)throw new Error('Interrupted');}});else{const request={...step,windowId:actionFrame.window.id};if(['click','doubleclick','rightclick','scroll'].includes(step.kind)&&Number.isFinite(step.x))Object.assign(request,coordinates(actionFrame,step.x,step.y));await this.bridge.call('action',request);}}
-    const fresh=await this.observe();if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(fresh));return;
+    const fresh=await this.observe();if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(fresh),fresh);return;
    }
    if(this.background&&!this.state.proactive)throw new Error('Spontaneous highlights are off');
    if(tool==='screen_annotate')this.emit('annotation',{mark:validateAnnotation(a,f),frame:f});
@@ -298,8 +301,10 @@ export class Companion extends EventEmitter{
   if(p.noticeSnoozeUntil!==undefined&&(!Number.isFinite(p.noticeSnoozeUntil)||p.noticeSnoozeUntil<0))throw new Error('Choose a valid notice snooze time');
   if(p.noticeFeedback!==undefined)throw new Error('Use feedback on a notice to update its relevance');
   if(p.captureMode!==undefined&&!['window','monitor'].includes(p.captureMode))throw new Error('Choose window or monitor capture');
-  if(p.excludedApps!==undefined){p={...p,excludedApps:excludedApps(p.excludedApps)};this.privacyConfigurationError=null;}
-  const replace=p.prompt!==undefined&&p.prompt!==this.state.prompt;if(replace&&this.state.connection==='connected')await this.replacePrompt(p.prompt);
+  if(p.excludedApps!==undefined)p={...p,excludedApps:excludedApps(p.excludedApps)};
+  const replace=p.prompt!==undefined&&p.prompt!==this.state.prompt;
+  if(replace){if(this.state.connection!=='connected')throw new Error('Wait for the connection to recover before saving instructions. Your edits have not been saved.');await this.replacePrompt(p.prompt);}
+  if(p.excludedApps!==undefined)this.privacyConfigurationError=null;
   for(const k of [...settingsKeys,'running'])if(p[k]!==undefined)this.state[k]=p[k];
   this.state.opacity=Math.max(.45,Math.min(1,Number(this.state.opacity)||1));this.state.backgroundInterval=Math.max(10000,Math.min(600000,Number(this.state.backgroundInterval)||20000));
   if(p.running===false||p.inputMode==='wispr')this.voiceEpoch=(this.voiceEpoch??0)+1;

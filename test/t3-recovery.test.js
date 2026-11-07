@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { T3Companion } from '../src/t3-companion.js';
 import { T3Client } from '../src/t3-client.js';
+import {Companion} from '../src/companion.js';
+import {T3Workspace} from '../src/t3-workspace.js';
 import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
@@ -16,6 +18,7 @@ function companion() {
   c.providerNativeIds = new Map();
   c.providerContexts = new Map();
   c.save = async () => {};
+  c.saveT3 = async () => {};
   return c;
 }
 
@@ -135,7 +138,7 @@ test('acknowledged cancellation remains Stopping until the runtime confirms it',
   assert.deepEqual(await c.interrupt(), { confirmed: false });
   assert.equal(c.state.stopping, true);
   assert.equal(c.state.busy, true);
-  event(c, { id: 'run', status: 'interrupted' }, 'run.updated');
+  event(c, { id: 'run', runId: 'run', status: 'interrupted' }, 'run.updated');
   assert.equal(c.state.stopping, false);
   assert.equal(c.state.busy, false);
 });
@@ -274,3 +277,129 @@ test('archiving failure does not misreport successfully activated instructions a
   assert.equal(await readFile(join(dir,'context','AGENTS.md'),'utf8'),'New instructions.\n');assert.equal(c.t3ThreadId,'new');
   assert.equal(c.activities.at(-1).title,'Conversation history');assert.equal(c.activities.at(-1).status,'failed');
 }));
+
+test('disconnect then Stop preserves revocation, replays cancellation and only permits a new terminal-confirmed request',async()=>{
+ const c=companion();c.scheduleReconnect=()=>c.publish({connection:'reconnecting',busy:true,activity:'Reconnecting to T3'});let accepted=0;
+ c.t3={call:async(_tag,p)=>{event(c,{id:'stopped-run',userMessageId:p.messageId,status:'running'},'run.created');queueMicrotask(()=>c.t3Disconnected());return{};}};
+ await c.turn('Keep working',{onAccepted:()=>accepted++});assert.equal(accepted,1);assert.equal(c.state.connection,'reconnecting');assert.equal(c.state.busy,true);
+ // A settled local waiter must not erase the remote request's identity.
+ c.t3InFlight=false;let declined=false;c.confirmation={reject:()=>declined=true};
+ assert.deepEqual(await c.interrupt(),{confirmed:false});assert.equal(declined,true);assert.equal(c.desktopActionsRevoked,true);assert.equal(c.t3StopIntent.runId,'stopped-run');assert.notEqual(c.state.activity,'Ready');
+ const active={thread:{activeRunId:'stopped-run'},runs:[{id:'stopped-run',userMessageId:c.t3MessageId,status:'running'}]};let stops=0;
+ c.t3={call:async(tag,p)=>{if(tag==='orchestration.getThreadProjection')return active;if(p.type==='thread.stop')stops++;return{};}};c.t3TransportReady=true;c.state.connection='connecting';
+ c.restoreProjection(active);c.restoreProjection(active);await c.t3StopReplay.promise;
+ assert.equal(stops,1);assert.equal(c.t3StopIntent.runId,'stopped-run');assert.equal(c.desktopActionsRevoked,true);
+ const generation=c.generation;c.beginExternalRun(active.runs[0]);assert.equal(c.generation,generation);assert.equal(c.desktopActionsRevoked,true);
+ c.state.connection='connected';await assert.rejects(c.invokeDesktopTool('screen_windows',{}),/No active/);await assert.rejects(c.turn('Too early'),/not stopped/);
+ c.restoreProjection({thread:{},runs:[{...active.runs[0],status:'interrupted'}]});assert.equal(c.t3StopIntent,null);assert.equal(c.state.activity,'Ready');assert.equal(c.state.busy,false);
+ event(c,active.runs[0],'run.created');await assert.rejects(c.invokeDesktopTool('screen_windows',{}),/No active/);
+ c.bridge={call:async()=>[{id:'allowed-window'}]};let toolAccepted=false;
+ c.t3={call:async(_tag,p)=>{event(c,{id:'new-run',userMessageId:p.messageId,status:'running'},'run.created');toolAccepted=(await c.invokeDesktopTool('screen_windows',{})).success;event(c,{id:'new-run',status:'completed'},'run.updated');return{};}};
+ await c.turn('A new request',{onAccepted:()=>accepted++});assert.equal(accepted,2);assert.equal(toolAccepted,true);assert.equal(c.state.busy,false);
+});
+
+test('Stop retains an accepted message without a known run ID and learns it on reconnect',async()=>{
+ const c=companion();c.scheduleReconnect=()=>c.publish({connection:'reconnecting',busy:true});c.t3={call:async()=>({})};
+ await c.turn('Accepted before its run event',{onAccepted:()=>c.t3Disconnected()});const messageId=c.t3MessageId;
+ await c.interrupt();assert.equal(c.t3StopIntent.messageId,messageId);assert.equal(c.t3StopIntent.runId,null);
+ let stops=0;c.t3={call:async(tag,p)=>{if(p.type==='thread.stop')stops++;return tag==='orchestration.getThreadProjection'?{thread:{activeRunId:'recovered'},runs:[{id:'recovered',userMessageId:messageId,status:'running'}]}:{};}};c.t3TransportReady=true;
+ c.restoreProjection({thread:{activeRunId:'recovered'},runs:[{id:'recovered',userMessageId:messageId,status:'running'}]});await c.t3StopReplay.promise;
+ assert.equal(stops,1);assert.equal(c.t3StopIntent.runId,'recovered');assert.equal(c.ignoredT3Runs.has('recovered'),true);assert.equal(c.desktopActionsRevoked,true);
+});
+
+test('a pending disconnected Stop is saved and removed only by confirmed terminal state',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'hephaestus-stop-recovery-'));
+ try{
+  const c=companion();c.dataDir=dir;c.saveT3=T3Companion.prototype.saveT3.bind(c);c.state.connection='reconnecting';c.t3Outstanding={threadId:'thread',messageId:'user',runId:'run'};
+  await c.interrupt();let saved=JSON.parse(await readFile(join(dir,'t3-runtime.json'),'utf8'));assert.equal(saved.stopIntent.runId,'run');assert.equal(saved.stopIntent.messageId,'user');
+  c.restoreProjection({runs:[{id:'run',status:'interrupted'}]});await c.t3SaveQueue;saved=JSON.parse(await readFile(join(dir,'t3-runtime.json'),'utf8'));assert.equal(saved.stopIntent,undefined);assert.equal(c.desktopActionsRevoked,true);
+ }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+async function connectFixture(run,{stopIntent}={}){
+ const dir=await mkdtemp(join(tmpdir(),'hephaestus-readiness-'));
+ const originals={connect:Companion.prototype.connect,start:T3Client.prototype.start,call:T3Client.prototype.call,subscribe:T3Client.prototype.subscribe,close:T3Client.prototype.close,workspaceStart:T3Workspace.prototype.start,fetch:globalThis.fetch};
+ let entered,release;const controls={baseOptions:[],states:[],subscribed:false,usageCalls:0,stopCalls:0,projection:stopIntent?{thread:{activeRunId:stopIntent.runId},runs:[{id:stopIntent.runId,userMessageId:stopIntent.messageId,status:'running'}]}:{thread:{},runs:[]},entered:new Promise(r=>entered=r),gate:new Promise(r=>release=r),release:()=>release()};
+ try{
+  await writeFile(join(dir,'t3-runtime.json'),JSON.stringify({adapterVersion:5,projectId:'project',threadId:'thread',...(stopIntent?{stopIntent}:{})}));
+  Companion.prototype.connect=async function(options){controls.baseOptions.push(options);this.publish({connection:'connecting',activity:'Connecting to Codex'});if(options?.publishReady!==false)this.publish({connection:'connected',activity:'Ready'});};
+  T3Client.prototype.start=async function(){this.origin='http://127.0.0.1:12345';this.token='test-session';entered();await controls.gate;return this;};
+  T3Client.prototype.call=async function(tag,p={}){if(tag==='server.getConfig')return{providers:[{instanceId:'codex',status:'ready',auth:{type:'chatgpt'},models:[{slug:'gpt-6-luna',name:'Luna'}]}],settings:{}};if(tag==='orchestration.getThreadProjection')return structuredClone(controls.projection);if(p.type==='thread.stop'){controls.stopCalls++;controls.projection={thread:{},runs:[{id:stopIntent.runId,status:'interrupted'}]};}return{};};
+  T3Client.prototype.subscribe=function(){controls.subscribed=true;return()=>{};};T3Client.prototype.close=async()=>{};T3Workspace.prototype.start=async function(){return this;};
+  globalThis.fetch=async()=>({json:async()=>[{id:'project',workspaceRoot:join(dir,'context')}]});
+  const c=companion();c.dataDir=dir;c.desktopServer={};c.prepareWorkspace=async()=>{};c.updateUsage=async()=>{assert.equal(c.state.connection,'connected');controls.usageCalls++;};c.on('state',state=>controls.states.push({...state,subscribed:controls.subscribed}));
+  await run(c,controls);
+ }finally{
+  Companion.prototype.connect=originals.connect;T3Client.prototype.start=originals.start;T3Client.prototype.call=originals.call;T3Client.prototype.subscribe=originals.subscribe;T3Client.prototype.close=originals.close;T3Workspace.prototype.start=originals.workspaceStart;globalThis.fetch=originals.fetch;
+  await rm(dir,{recursive:true,force:true});
+ }
+}
+
+test('startup does not announce connected or Ready until T3 and its subscription are reconciled',async()=>connectFixture(async(c,controls)=>{
+ c.state.connection='connecting';const starting=c.connect();await controls.entered;
+ assert.deepEqual(controls.baseOptions,[{publishReady:false}]);assert.equal(controls.states.some(s=>s.connection==='connected'||s.activity==='Ready'),false);
+ controls.release();await starting;const connected=controls.states.filter(s=>s.connection==='connected');assert.equal(connected.length,1);assert.equal(connected[0].subscribed,true);assert.equal(c.state.activity,'Ready');assert.equal(controls.usageCalls,1);
+}));
+
+test('startup replays a saved Stop before announcing readiness and cannot resurrect that run',async()=>connectFixture(async(c,controls)=>{
+ c.state.connection='connecting';const starting=c.connect();await controls.entered;controls.release();await starting;
+ assert.equal(controls.stopCalls,1);assert.equal(c.t3StopIntent,null);assert.equal(c.desktopActionsRevoked,true);assert.equal(c.ignoredT3Runs.has('saved-run'),true);assert.equal(c.state.activity,'Ready');
+ c.restoreProjection({thread:{activeRunId:'saved-run'},runs:[{id:'saved-run',userMessageId:'saved-user',status:'running'}]});assert.equal(c.t3InFlight,false);await assert.rejects(c.invokeDesktopTool('screen_windows',{}),/No active/);
+},{stopIntent:{threadId:'thread',runId:'saved-run',messageId:'saved-user',requestedAt:1}}));
+
+test('subscription faults from a closed socket leave connected state before publishing the error',async()=>connectFixture(async(c,controls)=>{
+ c.state.connection='connecting';const starting=c.connect();await controls.entered;controls.release();await starting;
+ c.scheduleReconnect=()=>{};c.t3.socket={readyState:3};const transitions=[];c.on('state',state=>transitions.push({connection:state.connection,socketState:c.t3.socket.readyState}));
+ c.t3.emit('fault',new Error('Subscription disconnected'));const generation=c.generation;c.t3.emit('disconnected');
+ assert.equal(c.generation,generation);assert.ok(transitions.every(s=>s.connection!=='connected'));assert.equal(c.state.connection,'reconnecting');assert.equal(c.state.error,'Subscription disconnected');
+}));
+
+async function sharedFrameFixture(){
+ const c=companion();c.state.watching=true;c.hasT3History=true;
+ c.bridge={call:async command=>{if(command==='target-info')return{id:'window',process:'editor'};if(command==='capture')return{width:100,height:100,bounds:{x:0,y:0,width:100,height:100},image:'YQ==',window:{id:'window',process:'editor',title:'Editor'},capturedAt:Date.now(),captureSource:'window',fingerprint:''};throw Error(command);}};
+ const previous=await c.observe();c.shareModelObservation(previous);const shared=[];c.on('visionFrame',frame=>shared.push(frame));return{c,previous,shared};
+}
+
+test('upload and dispatch failures never replace the previously shared image or register unseen evidence',async()=>{
+ for(const failure of['upload','dispatch']){
+  const{c,previous,shared}=await sharedFrameFixture();let dispatched=0;
+  c.t3={call:async tag=>{if(tag==='assets.persistChatAttachments'){if(failure==='upload')throw Error('Upload failed');return{attachments:[{id:'asset'}]};}dispatched++;throw Error('Dispatch failed');}};
+  await assert.rejects(c.turn('Read this image'),/failed/);assert.equal(dispatched,failure==='upload'?0:1);assert.equal(shared.length,0);assert.equal(c.lastModelObservationId,previous.id);assert.equal(c.modelObservations.size,1);
+ }
+});
+
+test('a successful dispatch shares its image only when the request is acknowledged',async()=>{
+ const{c,previous,shared}=await sharedFrameFixture();let accepted=0;
+ c.t3={call:async(tag,p)=>{if(tag==='assets.persistChatAttachments'){assert.equal(shared.length,0);return{attachments:[{id:'asset'}]};}assert.equal(shared.length,0);assert.equal(c.lastModelObservationId,previous.id);queueMicrotask(()=>c.t3Finish?.());return{};}};
+ await c.turn('Read this image',{onAccepted:()=>accepted++});assert.equal(accepted,1);assert.equal(shared.length,1);assert.notEqual(shared[0].id,previous.id);assert.equal(c.modelObservation().id,shared[0].id);
+});
+
+test('run.created acknowledgement shares an accepted image once even if its dispatch reply is lost',async()=>{
+ const{c,shared}=await sharedFrameFixture();let accepted=0;
+ c.t3={call:async(tag,p)=>{if(tag==='assets.persistChatAttachments')return{attachments:[{id:'asset'}]};event(c,{id:'run',userMessageId:p.messageId,status:'running'},'run.created');assert.equal(shared.length,1);event(c,{id:'run',status:'completed'},'run.updated');throw Error('Reply lost');}};
+ await c.turn('Read this image',{onAccepted:()=>accepted++});assert.equal(accepted,1);assert.equal(shared.length,1);assert.equal(c.state.error,null);
+});
+
+test('privacy blocking at acknowledgement suppresses image sharing while retaining accepted text',async()=>{
+ const{c,previous,shared}=await sharedFrameFixture();let accepted=0;
+ c.t3={call:async tag=>{if(tag==='assets.persistChatAttachments')return{attachments:[{id:'asset'}]};c.state.screenPrivacyBlocked=true;queueMicrotask(()=>c.t3Finish?.());return{};}};
+ await c.turn('A text request',{onAccepted:()=>accepted++});assert.equal(accepted,1);assert.equal(shared.length,0);assert.equal(c.lastModelObservationId,previous.id);assert.equal(c.state.error,null);
+});
+
+test('recovery without a Stop restores the continuing request after a real disconnect',async()=>{
+ const c=companion();c.scheduleReconnect=()=>c.publish({connection:'reconnecting',busy:true});c.t3={call:async(_tag,p)=>{event(c,{id:'run',userMessageId:p.messageId,status:'running'},'run.created');queueMicrotask(()=>c.t3Disconnected());return{};}};
+ await c.turn('Continue this request');assert.equal(c.desktopActionsRevoked,true);assert.equal(c.t3InFlight,true);
+ c.restoreProjection({thread:{activeRunId:'run'},runs:[{id:'run',userMessageId:c.t3MessageId,status:'running'}]});assert.equal(c.desktopActionsRevoked,false);c.state.connection='connected';c.bridge={call:async()=>[{id:'window'}]};assert.equal((await c.invokeDesktopTool('screen_windows',{})).success,true);
+});
+
+test('an accepted but not-yet-projected message cannot be declared stopped from an empty snapshot',async()=>{
+ const c=companion();c.t3Outstanding={threadId:'thread',messageId:'accepted-user',runId:null,accepted:true};c.t3={call:async()=>({thread:{},runs:[]})};
+ assert.deepEqual(await c.interrupt(),{confirmed:false});assert.equal(c.state.stopping,true);assert.equal(c.desktopActionsRevoked,true);assert.notEqual(c.state.activity,'Ready');
+ c.restoreProjection({runs:[{id:'late-run',userMessageId:'accepted-user',status:'interrupted'}]});assert.equal(c.t3StopIntent,null);assert.equal(c.state.activity,'Ready');
+});
+
+test('closing revokes reconnection before waiting for a delayed T3 session close',async()=>{
+ const c=companion();let release,entered,reconnects=0;const waiting=new Promise(resolve=>entered=resolve),closed=new Promise(resolve=>release=resolve);
+ c.scheduleReconnect=()=>reconnects++;c.t3={close:async()=>{c.t3Disconnected();entered();await closed;}};
+ const closing=c.close();await waiting;assert.equal(c.closed,true);assert.equal(reconnects,0);release();await closing;assert.equal(reconnects,0);
+});

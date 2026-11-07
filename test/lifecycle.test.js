@@ -31,3 +31,12 @@ test('an exhausted included allowance cannot start another model request',async(
   let called=false;c.rpc={call:()=>{called=true;}};
   await assert.rejects(c.turn('Hello'),/allowance/);assert.equal(called,false);assert.equal(c.state.backgroundVision,false);
 });
+
+test('a reconnect already in progress cannot publish errors or restart after close',async()=>{
+ const c=new Companion({root:process.cwd(),dataDir:process.cwd()});let entered,release;
+ const started=new Promise(resolve=>entered=resolve),pending=new Promise(resolve=>release=resolve);
+ c.rpc={removeAllListeners(){},close(){}};c.connect=async()=>{entered();await pending;throw new Error('Connection ended during close');};
+ const states=[];c.on('state',state=>states.push(state));c.scheduleReconnect();await started;await c.close();
+ const before=states.length;release();await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(states.length,before);assert.equal(c.reconnectTimer,null);assert.equal(c.closed,true);
+});

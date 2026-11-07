@@ -7,7 +7,8 @@ import{t3Tools}from'./t3-workspace.js';
 const root=join(dirname(fileURLToPath(import.meta.url)),'..');
 const qualityMode=process.argv.includes('--quality-check')||process.argv.includes('--quality-check-fast');
 const sessionMode=process.argv.includes('--session-check');
-if(qualityMode||sessionMode){const verificationData=join(root,'runtime',sessionMode?'session-verification':'quality-verification');mkdirSync(verificationData,{recursive:true});app.setPath('userData',verificationData);}
+const routeMode=process.argv.includes('--route-check');
+if(qualityMode||sessionMode||routeMode){const verificationData=join(root,'runtime',routeMode?'route-verification':sessionMode?'session-verification':'quality-verification');mkdirSync(verificationData,{recursive:true});app.setPath('userData',verificationData);}
 // Retain the existing data directory and desktop installation.
 app.setName('Screen Companion');app.commandLine.appendSwitch('autoplay-policy','no-user-gesture-required');
 const locked=app.requestSingleInstanceLock();if(!locked)app.quit();
@@ -99,7 +100,7 @@ async function boot(){
  bubble=createWindow('bubble.html',{width:366,height:200,focusable:false,title:'Hephaestus · Reply'});
  ink=createWindow('ink.html',{...overlayBounds(),focusable:false,title:'Hephaestus · Highlights'});ink.setIgnoreMouseEvents(true);
  companion=new T3Companion({root,dataDir:process.argv.includes('--t3-check')?join(root,'runtime/t3-verification'):process.argv.includes('--revision-check')?join(root,'runtime/revision-verification'):process.argv.includes('--hephaestus-check')?join(root,'runtime/hephaestus-verification'):app.getPath('userData'),excludePids:[process.pid],openBrowser:()=>shell.openExternal('microsoft-edge:about:blank')});
- if(qualityMode||sessionMode){
+ if(qualityMode||sessionMode||routeMode){
   const overrides={watching:false,backgroundVision:false,proactive:false,inputMode:'wispr',spokenReplies:false};Object.assign(companion.state,overrides);
   await mkdir(companion.dataDir,{recursive:true});let verificationSettings={};try{verificationSettings=JSON.parse(await readFile(join(companion.dataDir,'settings.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
   await writeFile(join(companion.dataDir,'settings.json'),JSON.stringify({...verificationSettings,...overrides},null,2));
@@ -107,7 +108,7 @@ async function boot(){
  session.defaultSession.setPermissionRequestHandler((contents,p,cb)=>cb(p==='media'&&contents===mascot.webContents&&companion.state.inputMode==='always'&&companion.state.running));
  session.defaultSession.setPermissionCheckHandler((contents,p)=>p==='media'&&contents===mascot.webContents&&companion.state.inputMode==='always'&&companion.state.running);
  let positioned=false,wasBusy=false;
- companion.on('state',s=>{deliver('state',s);mascot.setOpacity(s.opacity);tray?.setToolTip(`Hephaestus · ${s.activity}`);const menuKey=String(s.running)+'/'+String((s.noticeSnoozeUntil??0)>Date.now());if(tray&&menuKey!==trayMenuKey){trayMenuKey=menuKey;tray.setContextMenu(menu());}if(!positioned&&s.connection==='connected'){positioned=true;if(s.mascotPosition){const p=clampPosition(s.mascotPosition);mascot.setPosition(p.x,p.y);}}if(s.busy&&!wasBusy&&!String(s.activity).startsWith('Refreshing'))showBubble();wasBusy=s.busy;});
+ companion.on('state',s=>{if(quitting)return;deliver('state',s);mascot.setOpacity(s.opacity);tray?.setToolTip(`Hephaestus · ${s.activity}`);const menuKey=String(s.running)+'/'+String((s.noticeSnoozeUntil??0)>Date.now());if(tray&&menuKey!==trayMenuKey){trayMenuKey=menuKey;tray.setContextMenu(menu());}if(!positioned&&s.connection==='connected'){positioned=true;if(s.mascotPosition){const p=clampPosition(s.mascotPosition);mascot.setPosition(p.x,p.y);}}if(s.busy&&!wasBusy&&!String(s.activity).startsWith('Refreshing'))showBubble();wasBusy=s.busy;});
  companion.on('message',m=>{deliver('message',m);if(m.role==='user'){popupSuppressed=false;send(bubble,'thinking',{});}else if(m.role==='assistant'){if(m.source==='noticed')popupSuppressed=false;showBubble();}});
  companion.on('messageUpdated',m=>deliver('messageUpdated',m));
  companion.on('messagesRestored',messages=>deliver('messagesRestored',messages));
@@ -186,7 +187,7 @@ async function boot(){
  await companion.start();shortcutTimer=setInterval(()=>safe(installWispr()),15000);
  if(!process.argv.includes('--background'))await showDashboard();
  if(process.argv.includes('--hephaestus-check')){const{hephaestusCheck}=await import('../scripts/hephaestus-check.js');await hephaestusCheck({dashboard,mascot,bubble,ink,companion,root,showDashboard,showBubble,placeBubble,moveAttention,wisprKey});}
- if(process.argv.includes('--route-check')){const{wisprRouteCheck}=await import('../scripts/wispr-route-check.js');await wisprRouteCheck({dashboard,mascot,bubble,companion,root,wisprKey,showDashboard,showBubble});}
+ if(routeMode){const{wisprRouteCheck}=await import('../scripts/wispr-route-check.js');const passed=await wisprRouteCheck({dashboard,mascot,bubble,companion,root,wisprKey,showDashboard,showBubble,app});verificationExitCode=passed?0:1;app.quit();return;}
  if(process.argv.includes('--revision-check')){const{revisionCheck}=await import('../scripts/revision-check.js');await revisionCheck({dashboard,mascot,bubble,companion,root,showDashboard,showBubble});}
  if(process.argv.includes('--t3-check')){const{t3Check}=await import('../scripts/t3-check.js');await t3Check({dashboard,mascot,bubble,companion,root,showDashboard,showBubble,runtimeView:()=>runtimeView,runtimeDiagnostics:()=>runtimeDiagnostics});}
  if(process.argv.includes('--installed-check')){const{installedCheck}=await import('../scripts/installed-check.js');await installedCheck({dashboard,mascot,bubble,companion,root,showDashboard,wisprKey,runtimeView:()=>runtimeView});}
@@ -195,5 +196,5 @@ async function boot(){
  if(sessionMode){const{sessionCheck}=await import('../scripts/session-check.js');const passed=await sessionCheck({dashboard,mascot,bubble,companion,root,showDashboard,app});verificationExitCode=passed?0:1;app.quit();}
 }
 function menu(){return Menu.buildFromTemplate([{label:'Open Hephaestus',click:()=>safe(showDashboard())},{label:'Voice & listening',click:()=>safe(showDashboard('voice'))},{label:'Instructions',click:()=>safe(showDashboard('instructions'))},{type:'separator'},{label:companion?.state.running?'Pause companion':'Resume companion',click:()=>safe(companion.configure({running:!companion.state.running}))},{label:(companion?.state.noticeSnoozeUntil??0)>Date.now()?'Resume spontaneous observations':'Quiet for 15 minutes',click:()=>safe(companion.configure({noticeSnoozeUntil:(companion.state.noticeSnoozeUntil??0)>Date.now()?0:Date.now()+15*60000}))},{type:'separator'},{label:'Show / hide answer bubble',click:()=>{if(bubble.isVisible())dismissBubble();else{popupSuppressed=false;showBubble();}}},{label:'Clear highlights',click:()=>send(ink,'clearInk',{})},{label:'Stop reply · Ctrl+Alt+Esc',click:()=>safe(companion.interrupt())},{type:'separator'},{label:'Quit Hephaestus',click:()=>app.quit()}]);}
-app.on('before-quit',e=>{if(closing)return;e.preventDefault();closing=true;quitting=true;runtimeView?.webContents.close();globalShortcut.unregisterAll();clearInterval(shortcutTimer);clearInterval(animation);clearTimeout(routeTimer);clearInterval(recordingTimer);Promise.resolve(companion?.close()).then(()=>app.exit(verificationExitCode),error=>{console.error(error);app.exit(1);});});app.on('window-all-closed',()=>{});
+app.on('before-quit',e=>{if(closing)return;e.preventDefault();closing=true;quitting=true;runtimeView?.webContents.close();globalShortcut.unregisterAll();clearInterval(shortcutTimer);clearInterval(animation);clearTimeout(routeTimer);clearInterval(recordingTimer);if(qualityMode||sessionMode||routeMode)console.log('VERIFICATION_EXIT cleanup started');Promise.resolve(companion?.close()).then(()=>{if(qualityMode||sessionMode||routeMode)console.log('VERIFICATION_EXIT cleanup finished');app.exit(verificationExitCode);},error=>{console.error(error);app.exit(1);});});app.on('window-all-closed',()=>{});
 if(locked)app.whenReady().then(boot).catch(e=>{console.error(e);verificationExitCode=1;app.quit();});

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'rolled_back']);
@@ -27,7 +27,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
   };
   let phase = 'setup', previousStateKey = '', confirmationResult = null, injectedConfirmation = null;
   let observedClient = c.t3, transportEpoch = 0;
-  let cancellationTarget = null;
+  let cancellationTarget = null, offlineStopWatch = null, offlineStopAccepted = false;
   const deltas = [], privacyViolations = [], toolEvents = [];
   let speechEvents = 0, flushEvents = 0, allowCleanup = false;
 
@@ -62,14 +62,32 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
   const frames = () => ui('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
   const uiRequest = (command, params = {}) => ui(`window.companion.request(${JSON.stringify(command)},${JSON.stringify(params)})`);
   const projection = () => bounded(c.t3.call('orchestration.getThreadProjection', { threadId: c.t3ThreadId }, 10000), 12000, 'T3 did not return its real thread projection');
+  const intentSnapshot = intent => intent ? Object.fromEntries(['threadId', 'messageId', 'runId', 'accepted', 'requestedAt', 'sent'].filter(key => intent[key] !== undefined).map(key => [key, intent[key]])) : null;
   const stateListener = state => {
     if (c.t3 !== observedClient) { observedClient = c.t3; transportEpoch++; }
     const item = { elapsedMs: Date.now() - startedAt, connection: state.connection, busy: state.busy === true,
       stopping: state.stopping === true, pending: state.sendPending === true, activity: state.activity,
-      watching: state.watching === true, proactive: state.proactive === true, backgroundVision: state.backgroundVision === true, transportEpoch };
+      watching: state.watching === true, proactive: state.proactive === true, backgroundVision: state.backgroundVision === true, transportEpoch,
+      clientPresent: !!c.t3, clientSocketOpen: c.t3?.socket?.readyState === 1,
+      desktopActionsRevoked: c.desktopActionsRevoked === true, t3StopIntent: intentSnapshot(c.t3StopIntent), t3Outstanding: intentSnapshot(c.t3Outstanding) };
+    const offline = offlineStopWatch;
+    if (offline) item.monitoredRunStatus = c.t3Runs?.get(offline.runId)?.status ?? null;
     const key = JSON.stringify({ ...item, elapsedMs: 0 });
     if (key !== previousStateKey) { previousStateKey = key; report.stateTransitions.push(item); }
     if (item.watching || item.proactive || item.backgroundVision) privacyViolations.push(item.elapsedMs);
+    if (offline) {
+      if (state.connection === 'reconnecting' && !offline.stopPromise && c.t3 === offline.client) {
+        offline.record.offlineBeforeStop = { ...item };
+        offline.record.stopQueuedAt = Date.now();
+        offline.stopTransitionStart = report.stateTransitions.length;
+        offline.stopPromise = ui(`(() => {const stop=document.querySelector('#stop');if(stop.disabled)throw new Error('Stop is disabled while the accepted request is offline');const at=Date.now();stop.click();return {clicked:true,at};})()`)
+          .then(result => { offline.record.stopUI = result; return result; }, error => { offline.stopError = error; offline.record.stopError = safeError(error); return null; });
+      }
+      if (item.t3StopIntent?.runId === offline.runId && state.connection !== 'connected' && item.stopping && item.busy) {
+        offline.record.offlineAfterStop ??= { ...item };
+      }
+      if (state.activity === 'Ready') offline.record.readyTransitions.push({ ...item });
+    }
   };
   const deltaListener = data => {
     // A final-only reply also emits delta. Capture the provider item's streaming
@@ -181,6 +199,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
   }
   async function disconnectClient(id) {
     const client = c.t3, socket = client.socket, threadId = c.t3ThreadId, at = Date.now();
+    const transitionStart = report.stateTransitions.length;
     assert.equal(socket?.readyState, 1, 'Only an open app-client socket may be disconnected');
     const record = { id, atMs: at - startedAt, threadId, method: 'terminate app-owned WebSocket only', closed: false };
     report.transport.push(record);
@@ -193,6 +212,10 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     Object.assign(record, { reconnectMs: Date.now() - at, sameThread: c.t3ThreadId === threadId, transportEpoch });
     check(id, 'The app reconnects automatically after its own real socket is disconnected',
       record.closed && record.sameThread, 'real-transport', { reconnectMs: record.reconnectMs, sameThread: record.sameThread });
+    const connected = report.stateTransitions.slice(transitionStart).filter(state => state.connection === 'connected');
+    check(id + '-connected-truth', 'Every connected transition has a real open app-client socket',
+      connected.length > 0 && connected.every(state => state.clientPresent && state.clientSocketOpen),
+      'real-transport', { connectedTransitions: connected.length });
     assertPrivate();
     return record;
   }
@@ -404,6 +427,96 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
       'real-transport-model', { attempts: report.cancellationAttempts.length, outcomes: report.cancellationAttempts.map(attempt => attempt.outcome) });
     await snapshot('05-confirmed-stop.png');
 
+    phase = 'offline-stop-recovery';
+    const offlineRecord = { mode: 'stop-while-offline', readyTransitions: [], outcome: 'pending',
+      contract: ['t3Outstanding', 't3StopIntent', 't3StopIntent.requestedAt', 't3StopIntent.sent', 'desktopActionsRevoked'] };
+    report.offlineStop = offlineRecord;
+    const offlineToken = marker + '-OFFLINE-STOP';
+    const offlineRequest = await sendFromUI(`Write a substantive 1,500-word practical guide to making a home office comfortable and useful over time. Use ten sections with several detailed paragraphs and specific examples in each. Begin the first sentence with ${offlineToken}, then immediately continue with the actual guide; do not respond with only the token or a short summary. Give the guide itself, without tools, file access, screenshots, desktop interaction, or settings changes.`, 'offline-stop-send', {
+      onRun(run) {
+        assert.ok(!terminal.has(run.status) && c.state.busy && c.t3InFlight, 'The extra real request completed before offline Stop could be observed');
+        const client = c.t3, socket = client?.socket;
+        assert.equal(socket?.readyState, 1, 'The offline Stop scenario requires the actual open app-client socket');
+        Object.assign(offlineRecord, { runId: run.id, threadId: c.t3ThreadId, messageId: run.userMessageId,
+          disconnectedAt: Date.now(), preDisconnect: report.stateTransitions.at(-1), transitionStart: report.stateTransitions.length });
+        const watch = { record: offlineRecord, client, socket, runId: run.id, stopPromise: null };
+        watch.closedListener = () => { offlineRecord.socketClosed = true; };
+        offlineStopWatch = watch;
+        socket.once('close', watch.closedListener);
+        // Only this app client's transport is interrupted. The real daemon and
+        // the model run continue until the queued production Stop is replayed.
+        socket.terminate();
+      },
+    });
+    const offlineWatch = offlineStopWatch;
+    assert.ok(offlineWatch, 'The offline Stop observation was not armed');
+    await until(() => offlineWatch.stopPromise, 10000, 'The app did not expose reconnecting state for the offline Stop action');
+    await offlineWatch.stopPromise;
+    if (offlineWatch.stopError) throw offlineWatch.stopError;
+    await until(() => offlineRecord.offlineAfterStop, 5000, 'Offline Stop did not immediately retain a stopping intent');
+    const offlineState = offlineRecord.offlineAfterStop;
+    check('offline-stop-immediate', 'Offline Stop immediately blocks actions and retains the accepted request identity',
+      offlineRecord.stopUI?.clicked && offlineState.desktopActionsRevoked && offlineState.busy && offlineState.stopping &&
+      offlineState.activity !== 'Ready' && offlineState.connection !== 'connected' &&
+      offlineState.t3StopIntent?.threadId === offlineRecord.threadId && offlineState.t3StopIntent?.messageId === offlineRecord.messageId &&
+      offlineState.t3StopIntent?.runId === offlineRequest.runId && Number.isFinite(offlineState.t3StopIntent?.requestedAt),
+      'real-transport-ui', { stopQueuedAt: offlineRecord.stopQueuedAt, observed: offlineState });
+    const savedIntent = await until(async () => {
+      try { const saved = JSON.parse(await readFile(join(c.dataDir, 't3-runtime.json'), 'utf8')); return saved.stopIntent?.runId === offlineRequest.runId ? intentSnapshot(saved.stopIntent) : false; }
+      catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    }, 5000, 'The offline Stop intent was not persisted before automatic recovery');
+    offlineRecord.persistedStopIntent = savedIntent;
+    await snapshot('05b-offline-stop-pending.png');
+    await until(() => c.state.connection === 'connected' && c.t3 !== offlineWatch.client && c.t3?.socket?.readyState === 1 &&
+      !c.state.busy && !c.state.stopping && !c.t3InFlight && !c.t3StopIntent, 60000, 'The saved offline Stop was not reconciled to a confirmed terminal state');
+    offlineRecord.reconnectedAt = Date.now();
+    const offlineProjection = await projection(), offlineRun = offlineProjection.runs?.find(run => run.id === offlineRequest.runId);
+    assert.ok(offlineRun, 'The offline request is absent from the recovered canonical projection');
+    const offlineInterrupt = (offlineProjection.turnItems ?? []).find(item => item.runId === offlineRequest.runId && item.type === 'run_interrupt_request');
+    const offlineInterruptAt = Date.parse(offlineInterrupt?.startedAt ?? offlineInterrupt?.createdAt ?? offlineInterrupt?.completedAt);
+    const offlineCompletedAt = Date.parse(offlineRun.completedAt);
+    const offlineAttempts = new Set((offlineProjection.attempts ?? []).filter(attempt => attempt.runId === offlineRequest.runId).map(attempt => attempt.id));
+    const offlineTurns = (offlineProjection.providerTurns ?? []).filter(turn => offlineAttempts.has(turn.runAttemptId));
+    const offlineCancelled = cancelled.has(offlineRun.status) || offlineTurns.some(turn => cancelled.has(turn.status));
+    const naturalBeforeReplay = offlineRun.status === 'completed' && !offlineCancelled && (!offlineInterrupt ||
+      (Number.isFinite(offlineCompletedAt) && Number.isFinite(offlineInterruptAt) && offlineCompletedAt <= offlineInterruptAt));
+    const replayed = !!offlineInterrupt && Number.isFinite(offlineInterruptAt) && offlineInterruptAt >= savedIntent.requestedAt;
+    Object.assign(offlineRecord, { postRecovery: report.stateTransitions.at(-1), runStatus: offlineRun.status,
+      runCompletedAt: offlineRun.completedAt ?? null, interruptItemId: offlineInterrupt?.id ?? null,
+      interruptRequestedAt: offlineInterrupt?.startedAt ?? null, replayObserved: replayed, cancellationObserved: offlineCancelled,
+      providerStatuses: offlineTurns.map(turn => turn.status) });
+    const offlineTransitions = report.stateTransitions.slice(offlineRecord.transitionStart);
+    const offlineConnected = offlineTransitions.filter(state => state.connection === 'connected');
+    check('offline-connected-truth', 'Recovery reports connected only with its replacement client and open socket',
+      offlineRecord.socketClosed && c.t3 !== offlineWatch.client && offlineConnected.length > 0 &&
+      offlineConnected.every(state => state.clientPresent && state.clientSocketOpen), 'real-transport', { connectedTransitions: offlineConnected.length });
+    check('offline-no-premature-ready', 'Ready appears only after the offline request is canonically terminal and Stop intent is cleared',
+      terminal.has(offlineRun.status) && offlineRecord.readyTransitions.length > 0 &&
+      offlineRecord.readyTransitions.every(state => state.connection === 'connected' && state.clientSocketOpen &&
+        !state.busy && !state.stopping && !state.t3StopIntent && terminal.has(state.monitoredRunStatus)),
+      'real-transport-ui', { readyTransitions: offlineRecord.readyTransitions });
+    await bounded(c.t3SaveQueue ?? Promise.resolve(), 5000, 'The cleared Stop intent was not saved');
+    const savedAfterStop = JSON.parse(await readFile(join(c.dataDir, 't3-runtime.json'), 'utf8'));
+    check('offline-stop-intent-cleared', 'Confirmed terminal recovery clears the persisted Stop intent while desktop actions remain blocked',
+      !savedAfterStop.stopIntent && !c.t3StopIntent && c.desktopActionsRevoked === true && !offlineProjection.thread?.activeRunId,
+      'real-transport-ui', { runStatus: offlineRun.status, stopIntent: null, desktopActionsRevoked: c.desktopActionsRevoked });
+    if (naturalBeforeReplay) {
+      offlineRecord.outcome = 'not-exercised';
+      offlineRecord.reason = 'The real request completed while disconnected, before the stop replay could interrupt it.';
+      report.checks.push({ id: 'offline-stop-replay', name: 'Replay the offline Stop intent against an active runtime request', status: 'not-exercised',
+        kind: 'real-transport-model', reason: offlineRecord.reason, evidence: { runId: offlineRequest.runId, runStatus: offlineRun.status,
+          runCompletedAt: offlineRecord.runCompletedAt, interruptRequestedAt: offlineRecord.interruptRequestedAt } });
+      report.limitations.push('Offline stop replay has an observational gap: the request completed before recovery, so this scenario does not count as a replay/cancellation pass.');
+    } else {
+      check('offline-stop-replay', 'The replacement client replays Stop and confirms the canonical terminal request',
+        replayed && terminal.has(offlineRun.status), 'real-transport-model', { runId: offlineRequest.runId, runStatus: offlineRun.status,
+          interruptItemId: offlineRecord.interruptItemId, interruptRequestedAt: offlineRecord.interruptRequestedAt, cancellationObserved: offlineCancelled });
+      offlineRecord.outcome = 'replayed-and-confirmed'; offlineStopAccepted = true;
+    }
+    Object.assign(offlineRequest.entry, { status: offlineRun.status, offlineStopOutcome: offlineRecord.outcome, cancelled: offlineCancelled });
+    await snapshot('05c-offline-stop-recovered.png');
+    offlineWatch.socket.off('close', offlineWatch.closedListener); offlineStopWatch = null;
+
     phase = 'post-cancellation-request';
     const finalToken = marker + '-RECOVERED';
     const followup = await sendFromUI(`Text-only session verification. Do not use tools. Reply with exactly this token and nothing else: ${finalToken}`, 'recovery-send');
@@ -415,12 +528,15 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     check('session-clean', 'The recovered session is connected and ready with sharing disabled',
       c.state.connection === 'connected' && !c.state.busy && !c.state.stopping && !c.state.sendPending && !c.t3InFlight && c.confirmation === null && !c.state.error,
       'real-transport-ui', { connection: c.state.connection, busy: c.state.busy, stopping: c.state.stopping });
+    check('offline-stop-replay-required', 'The offline Stop scenario supplied actual replay evidence', offlineStopAccepted,
+      'real-transport-model', { outcome: offlineRecord.outcome, replayObserved: offlineRecord.replayObserved });
     assertPrivate(); report.success = true;
   } catch (error) {
     report.failure = { phase, message: safeError(error) };
     console.error('SESSION_CHECK failed during ' + phase + ': ' + safeError(error));
   } finally {
     cancellationTarget = null;
+    if (offlineStopWatch) { offlineStopWatch.socket.off('close', offlineStopWatch.closedListener); offlineStopWatch = null; }
     if (allowCleanup) {
       try {
         c.confirm(false);
