@@ -230,7 +230,7 @@ export class T3Companion extends Companion {
    if(this.externalT3Run||this.desktopActionsRevoked){this.externalT3Run=false;this.t3InFlight=false;this.turnId=null;this.publish({busy:false,stopping:false,background:false,activity:this.state.connection==='connected'?'Ready':'Reconnecting to T3'});}
   }
   // Restore missing transcript items without replaying speech or opening old popups.
-  this.restoreTranscript(p);
+  this.restoreTranscript(p,{persist:true});
   this.markEmptyReply(this.t3Runs?.get(this.t3RunId));
   for(const provider of p.providerThreads??[])this.providerUpdate(provider);
   for(const turn of p.providerTurns??[])this.providerTurnUpdate(turn);

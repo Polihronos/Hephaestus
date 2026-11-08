@@ -1,6 +1,6 @@
 {
   "name": "screen-companion",
-  "version": "3.2.6",
+  "version": "3.2.7",
   "description": "A screen-aware Windows desktop companion with voice, app controls, and an animated Hephaestus.",
   "license": "MIT",
   "repository": {

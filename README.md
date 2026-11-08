@@ -83,6 +83,10 @@ Sleep or screen lock pauses the companion. Elevated windows can reject input. Re
 
 Prerequisites: Windows, Node.js 22 or newer, the **.NET 8 SDK**, `uv`, and the signed-in [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) with trusted `PreToolUse` hook support (tested with 0.167.0). Native and official npm Codex installations are supported. T3 must be installed and running. Wispr Flow is needed only for its dictation mode.
 
+Before the first launch, enable T3's default **Codex** provider (`codex`) and sign in with your ChatGPT account. Luna 6 must be available in both Codex and the T3 provider's model catalog. Setup resolves the installed Codex launcher; it does not configure the T3 provider or grant model access.
+
+Open T3 at least once to create its local command and runtime files. Hephaestus connects to the local runtime using orchestration protocol 2. Standard discovery uses `%USERPROFILE%\.t3`; custom installations can set `T3CODE_HOME` and `T3CODE_CLI_PATH` before starting Hephaestus.
+
 ```powershell
 codex login status
 npm run setup

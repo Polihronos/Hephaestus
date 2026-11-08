@@ -184,3 +184,18 @@ test('an older delayed answer stays silent while a newer request awaits its run-
  assert.equal(c.t3RunId,null);assert.equal(c.t3MessageId,'starting-user');assert.equal(c.t3InFlight,true);assert.equal(c.state.busy,true);assert.equal(c.state.error,null);assert.notEqual(user(c).replyStatus,'empty');
  assert.equal((await saved(directory)).messages.filter(message=>message.providerItemId===late.id&&message.text===late.text).length,1);
 }));
+
+test('snapshot-only history is durable without an empty marker or a later save',()=>fixture(async(c,directory,events)=>{
+ const newer=run({id:'snapshot-current-run',userMessageId:'snapshot-current-user',status:'running'});
+ c.t3Runs.set(RUN,run());c.t3Runs.set(newer.id,newer);c.beginExternalRun(newer);
+ c.messages.push({id:'snapshot-current-local',role:'user',text:'The current request.',at:2,t3MessageId:newer.userMessageId,delivery:'sent'});
+ c.publish({error:'An unrelated current warning'});await c.save();await flush(c);events.length=0;
+ const generation=c.generation,answer=item({id:'snapshot-only-answer',text:'An older answer received only through a snapshot.',completedAt:new Date().toISOString()});
+ const p={thread:{id:THREAD,activeRunId:newer.id},runs:[run(),newer],messages:[],turnItems:[answer]};
+ c.restoreProjection(p);c.restoreProjection(p);await flush(c);
+ const row=assistant(c).find(message=>message.providerItemId===answer.id);assert.ok(row);assertNoAssistantEvents(events);
+ assert.equal(c.t3RunId,newer.id);assert.equal(c.generation,generation);assert.equal(c.t3InFlight,true);assert.equal(c.state.busy,true);assert.equal(c.state.error,'An unrelated current warning');assert.equal(user(c).replyStatus,undefined);
+ const reloaded=new T3Companion({root:process.cwd(),dataDir:directory});reloaded.messages=(await saved(directory)).messages;
+ assert.deepEqual(reloaded.messages.filter(message=>message.providerItemId===answer.id),[row]);
+ event(c,answer);await flush(c);assert.deepEqual((await saved(directory)).messages.filter(message=>message.providerItemId===answer.id),[row]);assertNoAssistantEvents(events);
+}));
