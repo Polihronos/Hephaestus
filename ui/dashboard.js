@@ -180,7 +180,11 @@ function render(next) {
   if (next.error && next.error !== lastStateError) { lastStateError = next.error; notice(new Error(next.error), {source:'state'}); }
   if (!next.error) { lastStateError = ''; if (noticeSource === 'state') hideNotice(); }
   refreshStopNotice();
-  if (!next.busy && !next.sendPending && !$('reply-draft').hidden && next.error) $('reply-draft').querySelector('.streaming-label').textContent = '· interrupted';
+  if (!$('reply-draft').hidden && (next.stopping || !next.busy && !next.sendPending)) {
+    $('reply-draft').querySelector('.streaming-label').textContent = next.stopping
+      ? next.activity === 'Stop not confirmed' ? '· stop not confirmed' : '· stopping'
+      : '· interrupted';
+  }
 }
 function canShowScreen() { return state.running === true && state.watching === true && state.screenPrivacyBlocked !== true; }
 function renderScreen() {

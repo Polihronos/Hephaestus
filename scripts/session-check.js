@@ -583,6 +583,16 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
         record.stopUI.approvalVisible && confirmationResult === 'declined' && c.confirmation === null && await ui('document.querySelector("#confirmation").hidden'),
         'fault-injection-integration', { approval: 'injected on real acceptance; no desktop action', result: confirmationResult });
       await recoverStopCacheFault(target, true);
+      if (actualStreams.length > 0) {
+        const stoppedReply = await until(() => ui(`(() => {
+          const draft=document.querySelector('#reply-draft'),label=draft.querySelector('.streaming-label').textContent;
+          return !draft.hidden && label==='· interrupted' && document.querySelector('#reply-state').textContent==='Ready'
+            ? {visible:true,label,header:document.querySelector('#reply-state').textContent}:false;
+        })()`), 5000, 'The cancelled partial answer still claims it is replying');
+        check('stopped-partial-label', 'Confirmed cancellation labels the visible partial answer as interrupted without requiring an error',
+          !c.state.busy && !c.state.stopping && c.state.error === null && stoppedReply.label === '· interrupted',
+          'real-ui-model', {runId:stopping.runId,...stoppedReply,error:c.state.error});
+      }
       record.outcome = 'cancelled'; record.approvalResult = confirmationResult;
       Object.assign(stopping.entry, { status: stoppedRun.status, cancelled: true });
       cancelledAttempt = record; cancellationTarget = null;
