@@ -326,7 +326,7 @@ export class Companion extends EventEmitter{
   if(p.running===false||p.inputMode==='wispr')this.voiceEpoch=(this.voiceEpoch??0)+1;
   if(p.running===false||p.watching===false||p.control===false||this.background&&(p.backgroundVision===false||p.proactive===false||p.noticeSnoozeUntil>Date.now()))await this.interrupt();
   if(p.running===false||p.watching===false||p.excludedApps!==undefined){this.clearScreen();if(!this.state.watching||!this.state.running)this.publish({screenPrivacyBlocked:false,screenPrivacyReason:null,screenWindow:null,captureSource:null});}
-  if(p.inputMode==='always')await this.startSpeech();this.publish();if(!replace)await this.save();if(this.state.running)await this.sample();return this.state;
+  if(p.inputMode==='always')await this.startSpeech();this.publish();if(!replace)await this.save();if(this.state.running)try{await this.sample();}catch(error){this.publish({screenError:error.message});}return this.state;
  }
  async close(){this.closed=true;clearInterval(this.screenTimer);clearInterval(this.visionTimer);clearInterval(this.usageTimer);clearTimeout(this.reconnectTimer);clearTimeout(this.bridgeTimer);clearTimeout(this.speechTimer);await this.interrupt();await this.historyImport;await this.saveQueue;await this.ledger?.flush();this.rpc?.close();this.speech?.close();this.bridge?.close();}
 }

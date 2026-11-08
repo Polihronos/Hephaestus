@@ -5,7 +5,7 @@ import {mkdir,readFile,writeFile,rename,unlink} from 'node:fs/promises';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {T3Workspace,t3Tools} from './t3-workspace.js';
-import {promptHash,writePromptTransaction,readPromptTransaction,clearPromptTransaction} from './prompt-recovery.js';
+import {promptHash,writePromptTransaction,readPromptTransaction,clearPromptTransaction,reconcilePromptTransaction} from './prompt-recovery.js';
 import {ensureOriginHook} from './origin-hooks.js';
 import {ensureProjectTrust} from './project-trust.js';
 
@@ -62,7 +62,7 @@ export class T3Companion extends Companion {
  async finishPromptRecovery(){
   const recovery=this.promptRecovery;if(!recovery)return;
   for(const threadId of new Set([recovery.oldThread,recovery.newThread]))if(threadId!==this.t3ThreadId)await this.t3.call('orchestration.dispatchCommand',{type:'thread.archive',commandId:randomUUID(),threadId}).catch(error=>this.activityEvent({id:randomUUID(),kind:'tool',title:'Instruction recovery',status:'failed',text:error.message}));
-  await clearPromptTransaction(this.dataDir);this.promptRecovery=null;
+  await clearPromptTransaction(this.dataDir,recovery);this.promptRecovery=null;
  }
  modelSelection(){return{instanceId:'codex',model:this.state.model,options:[{id:'reasoningEffort',value:this.state.effort??'low'},{id:'serviceTier',value:'default'}]};}
  runtimeContext(){return{name:'Hephaestus',runtime:'T3 Code through Codex',model:this.state.model,projectId:this.t3ProjectId,threadId:this.t3ThreadId,t3Connected:!!this.t3?.token,desktopConnected:!!this.bridge,appControl:this.state.control,watching:this.state.watching,proactive:this.state.proactive,desktopTools:dynamicTools.map(t=>t.name),workspaceTool:'t3_workspace',promptFile:join(this.dataDir,'context','AGENTS.md')};}
@@ -313,12 +313,13 @@ export class T3Companion extends Companion {
    if(stopped?.confirmed===false||this.state.stopping||this.t3InFlight)throw new Error('Your current request is still stopping. Wait for it to finish, then save your instructions again.');
    if(!this.t3)throw new Error('The connection is recovering. Your instructions have not been changed.');
    const client=this.t3,path=join(this.dataDir,'context','AGENTS.md'),oldThread=this.t3ThreadId;
+   await reconcilePromptTransaction(this.dataDir,{prompt:this.state.prompt,threadId:oldThread,persistIdentity:()=>this.saveT3()});
    let previous;try{previous=await readFile(path,'utf8');}catch(e){if(e.code!=='ENOENT')throw e;}
    const created=await this.t3.call('orchestration.launchThread',{commandId:randomUUID(),projectId:this.t3ProjectId,title:'Hephaestus',modelSelection:this.modelSelection(),runtimeMode:'full-access',interactionMode:'default',workspaceStrategy:{type:'root'}});
-   const buffered=[];let newSubscription,promptWritten=false,journalWritten=false,subscriptionError;
+   const buffered=[];let newSubscription,promptWritten=false,journal,subscriptionError;
    try{
     newSubscription=await client.subscribeReady('orchestration.subscribeThread',{threadId:created.threadId},item=>{if(this.t3ThreadId===created.threadId)this.t3Stream(item);else{if(item.kind==='snapshot'&&!Array.isArray(item.projection?.runs))throw new Error('The new conversation snapshot is invalid');buffered.push(item);}},{onError:error=>{subscriptionError=error;if(this.t3ThreadId===created.threadId)this.t3SubscriptionFailed(client,error);}});
-    await writePromptTransaction(this.dataDir,{oldThread,newThread:created.threadId,oldPromptHash:promptHash(this.state.prompt),newPromptHash:promptHash(prompt)});journalWritten=true;
+    journal=await writePromptTransaction(this.dataDir,{oldThread,newThread:created.threadId,oldPromptHash:promptHash(this.state.prompt),newPromptHash:promptHash(prompt)});
     await writeFile(path+'.tmp',prompt+'\n');await rename(path+'.tmp',path);promptWritten=true;
     if(subscriptionError)throw subscriptionError;if(this.t3!==client||this.state.connection!=='connected')throw new Error('The connection is recovering. Your instructions have not been changed.');
     if(this.t3InFlight||this.t3StopIntent)throw new Error('Another request started while instructions were being prepared. Wait for it to finish and save again.');
@@ -328,7 +329,7 @@ export class T3Companion extends Companion {
     let restored=!promptWritten;
     if(promptWritten)try{if(previous!==undefined){await writeFile(path+'.tmp',previous);await rename(path+'.tmp',path);}else await unlink(path).catch(e=>{if(e.code!=='ENOENT')throw e;});restored=true;}catch(rollbackError){this.promptRecoveryBlocked=true;this.publish({error:'Instructions could not be restored. Reconnect after fixing the settings folder before sending another request.'});}
     await unlink(path+'.tmp').catch(()=>{});
-    if(journalWritten&&restored)await clearPromptTransaction(this.dataDir).catch(()=>{});
+    if(journal&&restored)await clearPromptTransaction(this.dataDir,journal).catch(()=>{});
     await client.call('orchestration.dispatchCommand',{type:'thread.archive',commandId:randomUUID(),threadId:created.threadId}).catch(()=>{});
     throw error;
    }
@@ -343,7 +344,7 @@ export class T3Companion extends Companion {
    await client.call('orchestration.dispatchCommand',{type:'thread.archive',commandId:randomUUID(),threadId:oldThread}).catch(error=>{
     this.activityEvent({id:randomUUID(),kind:'tool',title:'Conversation history',status:'failed',text:'Instructions were saved. The previous conversation could not be archived: '+error.message});
    });
-   if(metadataSaved)await clearPromptTransaction(this.dataDir).catch(error=>this.activityEvent({id:randomUUID(),kind:'tool',title:'Instruction recovery',status:'failed',text:error.message}));
+   if(metadataSaved)await clearPromptTransaction(this.dataDir,journal).catch(error=>this.activityEvent({id:randomUUID(),kind:'tool',title:'Instruction recovery',status:'failed',text:error.message}));
   }finally{this.updatingPrompt=false;}
  }
  async close(){

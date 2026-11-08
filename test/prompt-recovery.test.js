@@ -86,6 +86,20 @@ test('a failed new subscription leaves the old prompt, file, settings and subscr
  assert.equal(await readFile(join(dir,'settings.json'),'utf8'),before);assert.equal(await readFile(join(dir,'context','AGENTS.md'),'utf8'),oldPrompt+'\n');assert.equal(c.state.prompt,oldPrompt);assert.equal(c.t3ThreadId,'old-thread');assert.equal(controls.oldStopped,0);assert.equal(controls.newStopped,1);assert.deepEqual(controls.archives,['new-thread']);assert.equal(await readPromptTransaction(dir,oldPrompt),null);assert.equal(c.state.instructionsSaving,false);
 }));
 
+test('screen-helper failure after a committed instruction save reports the screen error without rejecting or replacing the saved session',()=>promptFixture(async(c,dir,controls)=>{
+ c.state.running=true;c.state.watching=true;
+ c.bridge={call:async()=>{throw new Error('Screen helper disconnected');}};
+ const result=await c.configure({prompt:newPrompt});
+ assert.equal(result,c.state);assert.equal(c.state.prompt,newPrompt);assert.equal(c.state.instructionsSaving,false);
+ assert.equal(c.state.screenError,'Screen helper disconnected');assert.equal(c.state.error,null);
+ assert.equal(JSON.parse(await readFile(join(dir,'settings.json'),'utf8')).prompt,newPrompt);
+ assert.equal(await readFile(join(dir,'context','AGENTS.md'),'utf8'),newPrompt+'\n');
+ assert.equal(c.t3ThreadId,'new-thread');assert.deepEqual(controls.archives,['old-thread']);
+ assert.equal(controls.oldStopped,1);assert.equal(controls.newStopped,0);
+ c.bridge={call:async command=>command==='target-info'?{id:'editor',process:'editor'}:{width:100,height:100,image:'YQ==',window:{id:'editor',process:'editor',title:'Editor'},captureSource:'window'}};
+ await c.sample();assert.equal(c.state.screenError,null);assert.equal(c.t3ThreadId,'new-thread');assert.deepEqual(controls.archives,['old-thread']);
+}));
+
 test('messages cannot interrupt a prepared instruction transaction while its actual settings commit is pending',()=>promptFixture(async(c,dir,controls)=>{
  const save=c.save.bind(c);let entered,release;const waiting=new Promise(resolve=>entered=resolve),gate=new Promise(resolve=>release=resolve);let interrupted=0;c.interrupt=async()=>{interrupted++;return{confirmed:true};};
  c.save=async options=>{entered();await gate;return save(options);};const update=c.configure({prompt:newPrompt});

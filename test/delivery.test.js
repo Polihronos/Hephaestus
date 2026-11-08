@@ -9,6 +9,33 @@ class Input extends EventTarget {
   focus() {}
 }
 
+test('Enter preserves an unfinished input-method composition until a later deliberate send', async () => {
+  const input = new Input('  An unfinished composition'), sent = [];
+  createDictation(input, async (command, params) => {
+    sent.push({command, ...params});
+    return {accepted:true};
+  }, {manual:true});
+  const enter = isComposing => {
+    const event = new Event('keydown', {cancelable:true});
+    Object.assign(event, {key:'Enter', shiftKey:false, isComposing});
+    input.dispatchEvent(event);
+    return event;
+  };
+  const commit = enter(true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(commit.defaultPrevented, false);
+  assert.equal(sent.length, 0);
+  assert.equal(input.value, '  An unfinished composition');
+  input.value = '  A completed composition.\n';
+  input.dispatchEvent(new Event('compositionend'));
+  assert.equal(sent.length, 0);
+  const send = enter(false);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(send.defaultPrevented, true);
+  assert.deepEqual(sent, [{command:'send', text:'  A completed composition.\n', source:'text'}]);
+  assert.equal(input.value, '');
+});
+
 test('double submit while acknowledgement is pending dispatches only once', async () => {
   const input = new Input('A real request');
   let sends = 0;

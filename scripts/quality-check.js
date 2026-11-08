@@ -100,6 +100,25 @@ export async function qualityCheck({ dashboard, mascot, bubble, companion: c, ro
     await until(()=>dashboard.webContents.executeJavaScript(`!document.querySelector('#notice').hidden&&/16,?000/.test(document.querySelector('#notice-message').textContent)`),3000,'Oversized input did not receive a readable error');
     check('Oversized input remains intact and does not reach a model or transcript',c.messages.length===messagesBeforeLong&&c.t3Runs.size===runsBeforeLong&&await dashboard.webContents.executeJavaScript(String.raw`document.querySelector('#dashboard-input').value==='  '+'Я'.repeat(16001)+'\n'&&!document.querySelector('#notice-message').textContent.includes('remote method')`));
     await dashboard.webContents.executeJavaScript(`(()=>{const input=document.querySelector('#dashboard-input');input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#notice-dismiss').click();})()`);
+    const composingBefore={messages:new Set(c.messages.map(message=>message.id)),runs:new Set(c.t3Runs.keys())};
+    const composingSaved=await dashboard.webContents.executeJavaScript(`({draft:document.querySelector('#dashboard-input').value,noticeHidden:document.querySelector('#notice').hidden})`);
+    assert.ok(composingSaved.noticeHidden&&!c.state.sendPending,'The composing-key check requires the previous oversized-input notice to be dismissed');
+    try{
+      const keyboard=await dashboard.webContents.executeJavaScript(String.raw`(()=>{
+        const input=document.querySelector('#dashboard-input'),draft='  '+'\u6f22'.repeat(16001)+'\n';
+        input.value=draft;input.dispatchEvent(new Event('input',{bubbles:true}));
+        const event=new KeyboardEvent('keydown',{key:'Enter',code:'Enter',isComposing:true,bubbles:true,cancelable:true});
+        const defaultAllowed=input.dispatchEvent(event),inspect=window.hephaestusDashboardInspect();
+        return {isComposing:event.isComposing,defaultPrevented:event.defaultPrevented,defaultAllowed,draftPreserved:input.value===draft,
+          pending:inspect.sendPending||inspect.input.submitting,draftCharacters:draft.length};
+      })()`);
+      await until(()=>dashboard.webContents.executeJavaScript(`(()=>{const view=window.hephaestusDashboardInspect();return !view.sendPending&&!view.input.submitting;})()`),3000,'The composing-key check did not settle');
+      const preserved=await dashboard.webContents.executeJavaScript(String.raw`document.querySelector('#dashboard-input').value==='  '+'\u6f22'.repeat(16001)+'\n'&&document.querySelector('#notice').hidden`);
+      report.composingEnter={kind:'synthetic composing keyboard event',humanImeTrial:false,oversizedSafety:true,...keyboard};
+      check('Synthetic composing Enter preserves the unfinished draft without dispatch',keyboard.isComposing&&!keyboard.defaultPrevented&&keyboard.defaultAllowed&&keyboard.draftPreserved&&!keyboard.pending&&preserved&&!c.state.sendPending&&c.messages.length===composingBefore.messages.size&&c.messages.every(message=>composingBefore.messages.has(message.id))&&c.t3Runs.size===composingBefore.runs.size&&[...c.t3Runs.keys()].every(id=>composingBefore.runs.has(id)));
+    }finally{
+      await dashboard.webContents.executeJavaScript(`(()=>{document.querySelector('#notice-dismiss').click();const input=document.querySelector('#dashboard-input');input.value=${JSON.stringify(composingSaved.draft)};input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    }
 
     if (!fast) {
       const records = [];
