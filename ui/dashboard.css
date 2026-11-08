@@ -22,5 +22,26 @@ aside{width:218px;flex-shrink:0;background:#17191d;border-right:1px solid var(--
 [data-view=companion] .screen-caption,[data-view=companion] .screen-controls,[data-view=companion] .vision-time{flex-shrink:0}
 .conversation-card{container-type:size}
 .conversation-scroll{min-height:0}
+.conversation-card #answers{padding-top:10px}
 #dashboard-input{max-height:clamp(56px,calc(100cqh - 200px),150px)}
 @container(max-height:150px){.screen-empty{display:grid;grid-template-columns:26px minmax(0,1fr);gap:4px 10px;padding:10px 14px;text-align:left;width:100%}.screen-empty>span{grid-row:span 2;font-size:24px;margin:0}.screen-empty b{font-size:13px}.screen-empty p{margin:0;max-width:none}}
+
+@media(max-height:750px){
+ .content:has(>[data-view=companion]:not([hidden])){padding-block:12px}
+ .content:has(>[data-view=companion]:not([hidden]))>#notice{padding:9px 12px;margin-bottom:10px}
+ .view[data-view=companion] .hero{min-height:34px;margin-bottom:8px}
+ .view[data-view=companion] .card-heading{height:37px}
+ .view[data-view=companion] .live-progress{margin:6px 8px 0}
+ .view[data-view=companion] .live-progress>summary{min-height:30px;padding:5px 8px}
+ .view[data-view=companion] #answers{padding:10px 12px 1px}
+ .view[data-view=companion] .answer{padding-bottom:14px;margin-bottom:14px}
+ .view[data-view=companion] .presence-strip{padding:4px 10px;margin-top:6px}
+ .view[data-view=companion] .presence-strip .voice-orb{height:20px}
+ .view[data-view=companion] .presence-strip button{padding-block:4px}
+ #message-form{position:relative;margin:4px 8px 8px}
+ #message-form #dashboard-input{display:block;height:80px;min-height:64px;max-height:clamp(64px,calc(100cqh - 190px),96px);padding:8px 56px 22px 12px;overflow:auto}
+ #message-form #dashboard-input:placeholder-shown{height:52px;min-height:52px;max-height:52px}
+ #message-form>div{position:absolute;inset:auto 7px 7px 12px;padding:0;align-items:flex-end;pointer-events:none}
+ #message-form #compose-hint{font-size:11px;line-height:1.2}
+ #message-form #send{margin-left:auto;pointer-events:auto}
+}

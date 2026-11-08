@@ -10,7 +10,7 @@ const rawRequest = window.companion.request;
 let state = {}, frame = null, sentFrame = null, showSent = false, dirty = false, privacyDirty = false;
 let defaultPrompt = '', modelKey = '', lastScreenTitle = '', lastStateError = '', localPending = false, lastAttempt = null;
 let retryNotice = null, noticeSource = '', following = true, scrollFrame = 0, streamGeneration = -1, initialized = false, scrollIntentUntil = 0;
-let screenCollapsed = false, stopPending = false, noticeRevision = 0, latestStopId = null;
+let screenCollapsed = false, stopPending = false, noticeRevision = 0, latestStopId = null, streamItemId = null;
 try { screenCollapsed = localStorage.getItem('hephaestus.screenPanel') === 'hidden'; } catch { /* The panel still works if local storage is unavailable. */ }
 const messages = new Map();
 const time = value => value == null || !Number.isFinite(new Date(value).getTime()) ? 'Earlier' : new Date(value).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
@@ -264,7 +264,7 @@ function message(value, {restored = false} = {}) {
     row.append(actions);
   }
   messages.set(value.id,{row,message:value}); $('conversation-empty').hidden = true;
-  if (value.role === 'assistant') $('reply-draft').hidden = true;
+  if (value.role === 'assistant' && (!restored || value.providerItemId === streamItemId)) $('reply-draft').hidden = true;
   if (!old && !restored) {
     if (value.role === 'assistant') { activity(value.source === 'noticed' ? `Noticed: ${value.text}` : `Replied: ${value.text.slice(0,180)}`,value.at); announce(`Hephaestus: ${value.text}`); }
     if (value.role === 'user') following = true;
@@ -276,14 +276,16 @@ window.companion.onEvent((event,data) => {
   if (event === 'state') render(data);
   if (event === 'frame') setFrame(data);
   if (event === 'visionFrame') setFrame(data,true);
-  if (event === 'message' || event === 'messageUpdated') message(data);
+  if (event === 'message') message(data);
+  if (event === 'messageUpdated') message(data,{restored:true});
   if (event === 'messagesRestored') { for (const item of data ?? []) message(item,{restored:true}); followConversation(); }
   if (event === 'delta') {
     if ((data.generation ?? 0) < streamGeneration) return;
+    streamItemId = data.itemId ?? streamItemId;
     streamGeneration = data.generation ?? streamGeneration; $('conversation-empty').hidden = true; $('reply-draft').hidden = false;
     renderMarkdown($('reply-draft').querySelector('div'),data.full); followConversation();
   }
-  if (event === 'responseStart') { streamGeneration = data.generation ?? streamGeneration; $('reply-draft').querySelector('div').replaceChildren(); $('reply-draft').hidden = true; $('reply-draft').querySelector('.streaming-label').textContent = '· replying'; announce('Hephaestus is thinking.'); }
+  if (event === 'responseStart') { streamGeneration = data.generation ?? streamGeneration; streamItemId = null; $('reply-draft').querySelector('div').replaceChildren(); $('reply-draft').hidden = true; $('reply-draft').querySelector('.streaming-label').textContent = '· replying'; announce('Hephaestus is thinking.'); }
   if (event === 'activity') telemetry.activity(data);
   if (event === 'navigate') { navigate(data.page); if (data.focusInput) $('dashboard-input').focus(); }
   if (event === 'confirmation') { $('confirmation').hidden = !data; if (data) { $('confirm-reason').textContent = data.reason; announce('Hephaestus needs your approval. ' + data.reason); } }
@@ -359,12 +361,20 @@ window.hephaestusDashboardLayout = () => {
     const r=element.getBoundingClientRect();return {left:r.left,top:r.top,right:r.right,bottom:r.bottom,width:r.width,height:r.height,
       visible:r.width>0&&r.height>0&&r.left>=-1&&r.right<=innerWidth+1&&r.top>=(inContent?clip.top:0)-1&&r.bottom<=(inContent?clip.bottom:innerHeight)+1};
   };
-  const warning=$('notice'),text=$('notice-message'),retry=$('notice-retry'),stop=$('stop');
+  const warning=$('notice'),text=$('notice-message'),retry=$('notice-retry'),stop=$('stop'),answers=$('answers'),input=$('dashboard-input'),trace=document.querySelector('.live-progress');
+  const area=answers.getBoundingClientRect(),padding=getComputedStyle(answers),traceArea=trace.getBoundingClientRect(),jump=$('jump-latest'),jumpArea=jump.getBoundingClientRect();
+  const left=Math.max(clip.left,area.left+parseFloat(padding.paddingLeft)),right=Math.min(clip.right,area.right-parseFloat(padding.paddingRight));
+  let top=Math.max(clip.top,area.top+parseFloat(padding.paddingTop)),bottom=Math.min(clip.bottom,area.bottom-parseFloat(padding.paddingBottom));
+  const traceOverlap=Math.max(0,Math.min(bottom,traceArea.bottom)-Math.max(top,traceArea.top));if(traceOverlap)top=Math.max(top,traceArea.bottom);
+  const jumpOverlap=!jump.hidden?Math.max(0,Math.min(bottom,jumpArea.bottom)-Math.max(top,jumpArea.top)):0;if(jumpOverlap)bottom=Math.min(bottom,jumpArea.top-4);
+  const prose=getComputedStyle(answers.querySelector('.answer.assistant .markdown')??answers.querySelector('.answer.assistant')??answers),fontSize=parseFloat(prose.fontSize),lineHeight=parseFloat(prose.lineHeight)||fontSize*1.65,height=Math.max(0,bottom-top),visibleLines=new Set();
+  for(const body of answers.querySelectorAll('.answer.assistant .markdown')){const walker=document.createTreeWalker(body,NodeFilter.SHOW_TEXT);let node;while(node=walker.nextNode()){if(!node.textContent.trim())continue;const range=document.createRange();range.selectNodeContents(node);for(const r of range.getClientRects())if(r.width>0&&r.height>0&&r.top>=top-.5&&r.bottom<=bottom+.5&&r.left>=left-.5&&r.right<=right+.5)visibleLines.add(r.top.toFixed(1));}}
   return {viewport:{width:innerWidth,height:innerHeight,scale:devicePixelRatio},expanded:$('toggle-screen').getAttribute('aria-expanded')==='false',
     content:{height:content.clientHeight,scrollHeight:content.scrollHeight,scrollTop:content.scrollTop,noOverflow:content.scrollHeight<=content.clientHeight+1&&content.scrollTop<=1},
     warning:{...bounds(warning),lines:Math.round(text.clientHeight/parseFloat(getComputedStyle(text).lineHeight)),fullText:text.scrollHeight<=text.clientHeight+1&&text.scrollWidth<=text.clientWidth+1&&bounds(text).visible},
     warningActions:bounds(warning.querySelector('.notice-actions')),warningRetry:{hidden:retry.hidden,...bounds(retry)},warningDismiss:bounds($('notice-dismiss')),
-    composer:bounds($('message-form')),input:bounds($('dashboard-input')),send:{...bounds($('send')),disabled:$('send').disabled},
+    composer:bounds($('message-form')),input:{...bounds(input),characters:input.value.length,empty:input.value.length===0,scrollHeight:input.scrollHeight,clientHeight:input.clientHeight,minHeight:getComputedStyle(input).minHeight},send:{...bounds($('send')),disabled:$('send').disabled},
+    reading:{top,bottom,left,right,width:Math.max(0,right-left),unobscuredHeight:height,fontSize,lineHeight,lineCapacity:Math.floor((height+.1)/lineHeight),actualVisibleTextLines:visibleLines.size,traceHeight:traceArea.height,traceOverlap,jumpOverlap},trace:{...bounds(trace),open:trace.open,summary:bounds(trace.querySelector('summary'))},
     recovery:{...bounds(stop,false),disabled:stop.disabled,text:stop.textContent},
     screenControlsVisible:$('screen-context').hidden||['captureMode','monitor','refresh-screen','last-vision'].every(id=>bounds($(id)).visible)};
 };

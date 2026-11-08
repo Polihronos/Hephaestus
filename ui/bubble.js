@@ -24,6 +24,10 @@ window.companion.onEvent((event,data) => {
   if (event === 'responseStart') { generation = data.generation; activeTools.clear(); following = true; display(''); render(state); }
   if (event === 'activity' && data.kind === 'tool' && !data.background) { if (data.status === 'running' && state.busy && !state.background) activeTools.set(data.id,data.title); else activeTools.delete(data.id); render(state); }
   if (event === 'delta') { if (data.generation < generation) return; generation = data.generation; display(data.full); }
+  if (event === 'messagesRestored' && state.replyIssue?.kind === 'empty') {
+    const recovered = (data ?? []).filter(item => item.role === 'assistant' && item.turnId === state.replyIssue.runId && item.text?.trim()).at(-1);
+    if (recovered) display(recovered.toolWarning ? 'Action failed: ' + recovered.toolWarning + '\n\n' + recovered.text : recovered.text);
+  }
   if (event === 'message' && data.role === 'assistant') { activeTools.clear(); display(data.toolWarning ? 'Action failed: ' + data.toolWarning + '\n\n' + data.text : data.text,true); render(state); }
   if (event === 'placement') { document.body.classList.toggle('below',data.below); document.documentElement.style.setProperty('--tail',data.tail + 'px'); }
 });

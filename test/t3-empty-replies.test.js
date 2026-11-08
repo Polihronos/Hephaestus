@@ -137,3 +137,50 @@ test('a current completed no-text snapshot persists recovery status without addi
  assert.equal(assistant(c).length,0);assert.equal(user(c).replyStatus,'empty');assert.equal(user(c).delivery,'sent');assertNoTextError(c);assertNoAssistantEvents(events);
  assert.equal((await saved(directory)).messages.find(message=>message.id===user(c).id).replyStatus,'empty');
 }));
+
+for(const warning of ['owned','unrelated','newer'])test(`a recovered answer snapshot repairs its durable empty status while preserving ${warning} warning ownership`,()=>fixture(async(c,directory,events)=>{
+ event(c,run(),'run.updated');assert.equal(user(c).replyStatus,'empty');
+ let expectedError=null;
+ const runs=[run()];
+ if(warning==='unrelated'){expectedError='A newer screen helper warning';c.publish({error:expectedError});}
+ if(warning==='newer'){
+  c.messages.push({id:'newer-local-user',role:'user',text:'A newer question.',at:2,t3MessageId:'newer-remote-user',delivery:'sent'});
+  event(c,run({id:'newer-run',userMessageId:'newer-remote-user',status:'running'}),'run.created');
+  const newer=run({id:'newer-run',userMessageId:'newer-remote-user'});event(c,newer,'run.updated');runs.push(newer);expectedError=c.state.error;
+ }
+ events.length=0;
+ const answer=item({id:'snapshot-late-answer',text:'  The actual delayed answer.\nPreserve every character.  '});
+ const p={thread:{id:THREAD,activeRunId:null},runs,messages:[],turnItems:[answer]};
+ c.restoreProjection(p);c.restoreProjection(p);await flush(c);
+ assert.equal(assistant(c).length,1);assert.equal(assistant(c)[0].text,answer.text);assert.notEqual(user(c).replyStatus,'empty');assert.equal(user(c).delivery,'sent');
+ assert.equal(c.state.error,expectedError);assertNoAssistantEvents(events);assert.equal(c.t3FirstText,false);
+ const durable=(await saved(directory)).messages;assert.notEqual(durable.find(message=>message.id===user(c).id).replyStatus,'empty');
+ assert.equal(durable.filter(message=>message.providerItemId===answer.id).length,1);
+ if(warning==='newer'){assert.equal(c.state.replyIssue?.runId,'newer-run');assert.equal(c.messages.find(message=>message.id==='newer-local-user').replyStatus,'empty');}
+ else assert.equal(c.state.replyIssue,null);
+}));
+
+for(const delivery of ['event','snapshot'])test(`an older delayed answer delivered by ${delivery} cannot interrupt a newer active reply`,()=>fixture(async(c,directory,events)=>{
+ event(c,run(),'run.updated');assert.equal(user(c).replyStatus,'empty');
+ const newer=run({id:'active-newer-run',userMessageId:'active-newer-user',status:'running'});
+ c.messages.push({id:'active-newer-local-user',role:'user',text:'Current request.',at:2,t3MessageId:newer.userMessageId,delivery:'sent'});
+ event(c,newer,'run.created');event(c,item({id:'active-newer-item',runId:newer.id,text:'The newer reply is currently streaming.',streaming:true}));
+ c.publish({error:'A separate current warning'});const generation=c.generation,firstText=c.state.lastReplyMs;events.length=0;
+ const late=item({id:'older-delayed-final',text:'The older answer is recovered silently.',startedAt:new Date().toISOString()});
+ if(delivery==='event')event(c,late);else c.restoreProjection({thread:{id:THREAD,activeRunId:newer.id},runs:[run(),newer],turnItems:[late],messages:[]});
+ await flush(c);assertNoAssistantEvents(events);
+ assert.equal(c.t3RunId,newer.id);assert.equal(c.state.busy,true);assert.equal(c.t3InFlight,true);assert.equal(c.generation,generation);assert.equal(c.state.lastReplyMs,firstText);
+ assert.equal(c.state.error,'A separate current warning');assert.notEqual(user(c).replyStatus,'empty');
+ assert.equal(assistant(c).filter(message=>message.providerItemId===late.id&&message.text===late.text).length,1);
+ assert.equal((await saved(directory)).messages.filter(message=>message.providerItemId===late.id&&message.text===late.text).length,1);
+}));
+
+test('an older delayed answer stays silent while a newer request awaits its run-created event',()=>fixture(async(c,directory,events)=>{
+ event(c,run(),'run.updated');assert.equal(user(c).replyStatus,'empty');
+ c.messages.push({id:'starting-local-user',role:'user',text:'A newly dispatched request.',at:2,t3MessageId:'starting-user',delivery:'sent'});
+ c.t3MessageId='starting-user';c.t3RunId=null;c.t3InFlight=true;c.generation++;c.publish({busy:true,replyIssue:null,error:null});events.length=0;
+ const late=item({id:'previous-final-during-startup',text:'The older reply is recovered without claiming the newer response.',startedAt:new Date().toISOString()});
+ event(c,late);await flush(c);assertNoAssistantEvents(events);
+ assert.equal(c.t3RunId,null);assert.equal(c.t3MessageId,'starting-user');assert.equal(c.t3InFlight,true);assert.equal(c.state.busy,true);assert.equal(c.state.error,null);assert.notEqual(user(c).replyStatus,'empty');
+ assert.equal((await saved(directory)).messages.filter(message=>message.providerItemId===late.id&&message.text===late.text).length,1);
+}));

@@ -213,7 +213,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
           catch(error){report.stopWarningLayoutFailure={mode,...sizing};await snapshot(`05a-stop-warning-${width}-${mode}-sizing-failed.png`);throw error;}
           const geometry=await ui('window.hephaestusDashboardLayout()');await snapshot(`05a-stop-warning-${width}-${mode}.png`);
           check(`stop-warning-layout-${width}-${mode}`,`The real Stop warning, retry, composer and Send fit ${width}×${height} (${mode})`,
-            geometry.content.noOverflow&&geometry.warning.visible&&geometry.warning.fullText&&geometry.warningActions.visible&&!geometry.warningRetry.hidden&&geometry.warningRetry.visible&&geometry.warningDismiss.visible&&geometry.composer.visible&&geometry.input.visible&&geometry.send.visible&&geometry.recovery.visible&&!geometry.recovery.disabled&&geometry.screenControlsVisible,
+            geometry.content.noOverflow&&geometry.warning.visible&&geometry.warning.fullText&&geometry.warningActions.visible&&!geometry.warningRetry.hidden&&geometry.warningRetry.visible&&geometry.warningDismiss.visible&&geometry.composer.visible&&geometry.input.visible&&geometry.send.visible&&geometry.recovery.visible&&!geometry.recovery.disabled&&geometry.screenControlsVisible&&geometry.trace.summary.visible&&geometry.reading.lineCapacity>=(geometry.input.empty?7:6)&&(height>750||!geometry.input.empty||geometry.composer.height<=58),
             'real-ui-after-filesystem-transport-fault',{runId:record.runId,width,height,mode,sizing,geometry});
         }
       }finally{

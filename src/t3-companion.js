@@ -135,7 +135,7 @@ export class T3Companion extends Companion {
  }
  retainStoppedReplies(run,items=[]){
   if(!run?.id)return[];
-  const known=new Map(this.t3Seen??[]);for(const item of items)if(item.id)known.set(item.id,item);
+  const known=new Map(this.t3Seen??[]);for(const item of items)if(item.id)known.set(item.id,knownText(item,known.get(item.id)));
   const existing=new Set(this.messages.map(message=>message.providerItemId)),added=[];
   for(const item of known.values()){
    if(item.runId!==run.id||item.type!=='assistant_message'||!item.id||existing.has(item.id)||typeof item.text!=='string'||!item.text.trim())continue;
@@ -190,6 +190,27 @@ export class T3Companion extends Companion {
   const nativeTurn=this.turnId,nativeThread=this.activeThreadId;this.generation++;if(this.background&&nativeTurn){this.ignoredTurns??=new Set();this.ignoredTurns.add(nativeTurn);this.rpc.call('turn/interrupt',{threadId:nativeThread,turnId:nativeTurn}).catch(()=>{});this.finishTurn?.();this.finishTurn=null;}
   this.t3InFlight=true;this.t3Outstanding={threadId:this.t3ThreadId,messageId:run.userMessageId,runId:run.id,accepted:true};this.externalT3Run=true;this.desktopActionsRevoked=false;this.background=false;this.turnId=null;this.t3RunId=run.id;this.t3TurnStart=Date.now();this.t3FirstText=false;this.t3MessageId=run.userMessageId;this.currentUserText=run.request??'';this.actionCount=0;this.lastActionError=null;this.emit('responseStart',{generation:this.generation});this.publish({busy:true,stopping:false,background:false,replyIssue:null,activity:run.status==='waiting'?'Waiting for your answer':'Thinking'});return true;
  }
+ restoreTranscript(p,{persist=false}={}){
+  const answeredRuns=new Set();let transcriptChanged=false;
+  for(const remoteItem of p.turnItems??[]){
+   const item=this.t3Seen.get(remoteItem.id)??remoteItem;
+   if(item.streaming||!['assistant_message','user_message'].includes(item.type)||item.type==='assistant_message'&&!item.text?.trim())continue;
+   if(item.type==='assistant_message'&&item.runId)answeredRuns.add(item.runId);
+   const user=item.type==='user_message',remote=item.messageId?p.messages?.find(m=>m.id===item.messageId):null,run=this.t3Runs.get(item.runId);
+   const at=user?timestamp(remote?.createdAt,item.startedAt,item.createdAt,item.completedAt,run?.requestedAt,item.updatedAt):timestamp(item.completedAt,item.startedAt,item.createdAt,item.updatedAt);
+   const existing=this.messages.find(m=>m.providerItemId===item.id||(user&&item.messageId&&m.t3MessageId===item.messageId));
+   if(existing){
+    let changed=false;
+    if(user&&existing.delivery!=='sent'){existing.delivery='sent';delete existing.deliveryError;changed=true;}
+    if(at!==null&&existing.at!==at){existing.at=at;changed=true;}
+    if(changed){this.emit('messageUpdated',{...existing});transcriptChanged=true;}
+   }else{this.messages.push({id:randomUUID(),role:user?'user':'assistant',text:user?cleanText(item.text):item.text??'',at,providerItemId:item.id,...(user?{source:'workspace',t3MessageId:item.messageId}:{turnId:item.runId})});transcriptChanged=true;}
+  }
+  this.messages.sort((a,b)=>(a.at??0)-(b.at??0));this.messages=this.messages.slice(-120);
+  this.emit('messagesRestored',this.messages);
+  for(const runId of answeredRuns)this.clearEmptyReply(runId);
+  if(persist&&transcriptChanged)Promise.resolve(this.save()).catch(()=>this.publish({error:'The restored reply is visible, but could not be saved. Copy it before closing Hephaestus.'}));
+ }
  restoreProjection(p){
   for(const run of p.runs??[])this.t3Runs.set(run.id,{...run,request:cleanText(p.messages?.find(m=>m.id===run.userMessageId)?.text)});
   for(const attempt of p.attempts??[])this.t3Attempts.set(attempt.id,attempt.runId);
@@ -209,21 +230,7 @@ export class T3Companion extends Companion {
    if(this.externalT3Run||this.desktopActionsRevoked){this.externalT3Run=false;this.t3InFlight=false;this.turnId=null;this.publish({busy:false,stopping:false,background:false,activity:this.state.connection==='connected'?'Ready':'Reconnecting to T3'});}
   }
   // Restore missing transcript items without replaying speech or opening old popups.
-  for(const remoteItem of p.turnItems??[]){
-   const item=this.t3Seen.get(remoteItem.id)??remoteItem;
-   if(item.streaming||!['assistant_message','user_message'].includes(item.type)||item.type==='assistant_message'&&!item.text?.trim())continue;
-   const user=item.type==='user_message',remote=item.messageId?p.messages?.find(m=>m.id===item.messageId):null,run=this.t3Runs.get(item.runId);
-   const at=user?timestamp(remote?.createdAt,item.startedAt,item.createdAt,item.completedAt,run?.requestedAt,item.updatedAt):timestamp(item.completedAt,item.startedAt,item.createdAt,item.updatedAt);
-   const existing=this.messages.find(m=>m.providerItemId===item.id||(user&&item.messageId&&m.t3MessageId===item.messageId));
-   if(existing){
-    let changed=false;
-    if(user&&existing.delivery!=='sent'){existing.delivery='sent';delete existing.deliveryError;changed=true;}
-    if(at!==null&&existing.at!==at){existing.at=at;changed=true;}
-    if(changed)this.emit('messageUpdated',{...existing});
-   }else this.messages.push({id:randomUUID(),role:user?'user':'assistant',text:user?cleanText(item.text):item.text??'',at,providerItemId:item.id,...(user?{source:'workspace',t3MessageId:item.messageId}:{turnId:item.runId})});
-  }
-  this.messages.sort((a,b)=>(a.at??0)-(b.at??0));this.messages=this.messages.slice(-120);
-  this.emit('messagesRestored',this.messages);
+  this.restoreTranscript(p);
   this.markEmptyReply(this.t3Runs?.get(this.t3RunId));
   for(const provider of p.providerThreads??[])this.providerUpdate(provider);
   for(const turn of p.providerTurns??[])this.providerTurnUpdate(turn);
@@ -248,6 +255,8 @@ export class T3Companion extends Companion {
   const old=this.t3Seen.get(p.id),incomingText=p.text;p=knownText(p,old);this.t3Seen.set(p.id,p);
   if(p.type==='assistant_message'){
    if(!p.text?.trim()||p.streaming&&!incomingText?.trim())return;
+   const historical=p.runId&&(this.t3RunId?p.runId!==this.t3RunId:this.t3InFlight&&terminal.has(this.t3Runs.get(p.runId)?.status));
+   if(historical){if(!p.streaming)this.restoreTranscript({turnItems:[p]},{persist:true});return;}
    this.clearEmptyReply(p.runId);
    if(p.streaming){if(!this.t3FirstText){this.t3FirstText=true;this.publish({lastReplyMs:Date.now()-this.t3TurnStart});}this.emit('delta',{itemId:p.id,turnId:p.runId,generation:this.generation,full:p.text,text:p.text.slice(old?.text?.length??0)});}
    else if(!this.messages.some(m=>m.providerItemId===p.id)){

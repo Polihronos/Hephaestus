@@ -18,6 +18,8 @@ The conversation can take the full dashboard width with **Hide screen**. Streami
 
 After confirmed Stop, the text already received stays in the conversation with an **Interrupted** label. It is saved immediately and remains available when you start another request.
 
+Late replies are recovered into history without interrupting a newer reply.
+
 If a request finishes without a text reply, it is marked **No text reply**. **Review message** returns the original text to the composer. Check Activity for any completed actions before sending it again.
 
 If cancellation is not confirmed, **Retry Stop** retries the original request. After the reply has stopped, **Save Stop recovery** retries saving its recovery record for the next startup. Recovery-save retries do not cancel a newer request. A recovery-write error does not prevent Hephaestus from requesting cancellation while connected.

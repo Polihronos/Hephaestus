@@ -108,3 +108,16 @@ test('a naturally completed run does not mislabel a recovered completed answer a
  assert.equal(assistant(c)[0].providerItemId,final.id);assert.equal(assistant(c)[0].turnId,RUN);silent(events);
  assert.deepEqual((await saved(directory)).messages,assistant(c));
 }));
+
+for(const mode of ['direct','snapshot'])test(`a blank Stop closing item keeps received text labelled and durable through ${mode} reconciliation`,()=>fixture(async(c,directory,events)=>{
+ const streamed=item(),closing=item({streaming:false,status:'completed',text:' \n\t\u00a0'});
+ c.t3Seen.set(streamed.id,streamed);armStop(c);
+ const p=projection([closing]);
+ if(mode==='direct')assert.equal(c.reconcilePendingStop(p),true);else c.restoreProjection(p);
+ const message=retained(c),id=message.id;silent(events);await flush(c);
+ assert.deepEqual((await saved(directory)).messages.find(value=>value.providerItemId===streamed.id),message);
+ c.beginExternalRun(run('running','next-real-request'));assert.equal(retained(c).id,id);
+ c.restoreProjection(p);await flush(c);assert.equal(retained(c).id,id);
+ const reloaded=initialize(directory);reloaded.messages=(await saved(directory)).messages;
+ reloaded.restoreProjection(p);assert.equal(retained(reloaded).id,id);
+}));
