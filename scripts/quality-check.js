@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import {verifyInstructionSettings} from './settings-check.js';
+import {verifyOrdinarySettings} from './ordinary-settings-check.js';
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check, timeout = 15000, message = 'Condition was not met') {
@@ -94,6 +95,9 @@ export async function qualityCheck({ dashboard, mascot, bubble, companion: c, ro
     report.instructions=await verifyInstructionSettings({root,companion:c,dashboard,showDashboard,out});
     for(const name of report.instructions.checks)check(name,true);
     report.screenshots.push(...report.instructions.screenshots);
+    report.ordinarySettings=await verifyOrdinarySettings({root,companion:c,dashboard,mascot,showDashboard,out});
+    for(const name of report.ordinarySettings.checks)check(name,true);
+    report.screenshots.push(...report.ordinarySettings.screenshots);
     await showDashboard('companion');
     const messagesBeforeLong=c.messages.length,runsBeforeLong=c.t3Runs.size;
     await dashboard.webContents.executeJavaScript(String.raw`(()=>{const input=document.querySelector('#dashboard-input');input.value='  '+'Я'.repeat(16001)+'\n';input.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#message-form').requestSubmit();})()`);

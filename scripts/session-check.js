@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, writeFile, lstat, readdir, rmdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { signToolOrigin, TOOL_ORIGIN_FIELD } from '../src/tool-origin.js';
 
@@ -13,7 +13,8 @@ const safeError = error => String(error?.message ?? error)
   .slice(0, 1200);
 
 // Uses the production windows and a real T3 session. The only injected faults are
-// a missing local entry, an action-free approval, and a signed obsolete origin.
+// a missing local entry, an action-free approval, a signed obsolete origin, and
+// an owned empty directory blocking the isolated Stop recovery file write.
 // No microphone, desktop capture, fabricated reply, or daemon restart is involved.
 export async function sessionCheck({ dashboard, mascot, bubble, companion: c, root, showDashboard, app }) {
   const out = join(root, 'artifacts', 'session-check');
@@ -29,6 +30,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
   let phase = 'setup', previousStateKey = '', confirmationResult = null, injectedConfirmation = null;
   let observedClient = c.t3, transportEpoch = 0;
   let cancellationTarget = null, offlineStopWatch = null, offlineStopAccepted = false;
+  let verifiedProfile = null, stopCacheFault = null;
   const deltas = [], privacyViolations = [], toolEvents = [];
   let speechEvents = 0, flushEvents = 0, allowCleanup = false;
 
@@ -63,7 +65,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
   const frames = () => ui('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
   const uiRequest = (command, params = {}) => ui(`window.companion.request(${JSON.stringify(command)},${JSON.stringify(params)})`);
   const projection = () => bounded(c.t3.call('orchestration.getThreadProjection', { threadId: c.t3ThreadId }, 10000), 12000, 'T3 did not return its real thread projection');
-  const intentSnapshot = intent => intent ? Object.fromEntries(['threadId', 'messageId', 'runId', 'accepted', 'requestedAt', 'sent'].filter(key => intent[key] !== undefined).map(key => [key, intent[key]])) : null;
+  const intentSnapshot = intent => intent ? Object.fromEntries(['threadId', 'messageId', 'runId', 'accepted', 'requestedAt', 'sent', 'retryId'].filter(key => intent[key] !== undefined).map(key => [key, intent[key]])) : null;
   const stateListener = state => {
     if (c.t3 !== observedClient) { observedClient = c.t3; transportEpoch++; }
     const item = { elapsedMs: Date.now() - startedAt, connection: state.connection, busy: state.busy === true,
@@ -71,6 +73,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
       watching: state.watching === true, proactive: state.proactive === true, backgroundVision: state.backgroundVision === true, transportEpoch,
       clientPresent: !!c.t3, clientSocketOpen: c.t3?.socket?.readyState === 1,
       desktopActionsRevoked: c.desktopActionsRevoked === true, t3StopIntent: intentSnapshot(c.t3StopIntent), t3Outstanding: intentSnapshot(c.t3Outstanding) };
+    Object.assign(item, { stopPersistenceError: state.stopPersistenceError ?? null, stopRetryAvailable: state.stopRetryAvailable === true, stopRequestPending: state.stopRequestPending === true });
     const offline = offlineStopWatch;
     if (offline) item.monitoredRunStatus = c.t3Runs?.get(offline.runId)?.status ?? null;
     const key = JSON.stringify({ ...item, elapsedMs: 0 });
@@ -105,6 +108,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
   };
   function queueStop(target, trigger) {
     if (target.stopPromise) return;
+    assert.ok(stopCacheFault?.record === target.record && stopCacheFault.owned, 'The isolated Stop write fault must be armed before the production Stop click');
     target.record.trigger = trigger;
     target.record.stopQueuedAt = Date.now();
     target.stopTransitionStart = report.stateTransitions.length;
@@ -134,6 +138,88 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     await frames();
     await bounded(writeFile(join(out, name), (await target.webContents.capturePage()).toPNG()), 5000, 'Could not save the session screenshot');
     report.screenshots.push(name);
+  }
+  const samePath = (left, right) => resolve(left).toLowerCase() === resolve(right).toLowerCase();
+  const exists = async path => { try { return await lstat(path); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } };
+  async function faultIO(promise, label, cleanup = false) {
+    if (!cleanup) return bounded(promise, 2000, label);
+    let timer;
+    try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label)), 2000); })]); }
+    finally { clearTimeout(timer); }
+  }
+  async function guardFaultProfile(cleanup = false) {
+    assert.ok(allowCleanup && verifiedProfile, 'Stop write fault requires the validated isolated session profile');
+    const [data, userData] = await faultIO(Promise.all([realpath(c.dataDir), realpath(app.getPath('userData'))]), 'Could not verify the Stop fault profile', cleanup);
+    assert.ok(samePath(data, verifiedProfile) && samePath(userData, verifiedProfile), 'The isolated Stop fault profile changed');
+  }
+  async function armStopCacheFault(record) {
+    assert.equal(stopCacheFault, null, 'A previous Stop write fault has not been removed');
+    await guardFaultProfile();
+    await bounded(c.t3SaveQueue ?? Promise.resolve(), 5000, 'Existing recovery writes did not settle before Stop fault injection');
+    const file = join(verifiedProfile, 't3-runtime.json'), block = file + '.tmp';
+    const [info, existing, fileReal] = await faultIO(Promise.all([lstat(file), exists(block), realpath(file)]), 'Could not inspect the isolated recovery file');
+    assert.ok(info.isFile() && !info.isSymbolicLink() && samePath(fileReal, file), 'Stop recovery must be a regular file in the isolated profile');
+    assert.equal(existing, null, 'An existing recovery temporary path cannot be used as this check’s fault');
+    const saved = JSON.parse(await faultIO(readFile(file, 'utf8'), 'Could not read the real recovery identity'));
+    assert.equal(saved.threadId, c.t3ThreadId, 'The recovery file does not identify the current real session');
+    assert.ok(!saved.stopIntent && !c.t3StopIntent && !c.t3StopPersistenceDirty, 'The session already has unresolved Stop recovery');
+    const evidence = { kind: 'stop-recovery-write-filesystem-fault', attempt: record.attempt, path: 'runtime/session-verification/t3-runtime.json.tmp',
+      description: 'An owned empty directory at the actual isolated recovery temporary-file path makes the production Stop write fail. No provider result is substituted.', outcome: 'armed' };
+    const fault = stopCacheFault = { record, file, block, owned: false, evidence, creation: null };
+    fault.creation = mkdir(block).then(async () => { fault.owned = true; fault.identity = await lstat(block); });
+    await faultIO(fault.creation, 'Could not create the isolated Stop write fault');
+    assert.ok(fault.identity.isDirectory() && !fault.identity.isSymbolicLink(), 'The owned Stop fault is not a normal directory');
+    report.faultInjections.push(evidence);record.recoveryWriteFault = evidence;
+  }
+  async function removeStopCacheFault(cleanup = false) {
+    const fault = stopCacheFault;if (!fault) return;
+    if (fault.creation) await faultIO(fault.creation.catch(() => {}), 'Stop fault creation did not settle before cleanup', cleanup);
+    if (!fault.owned) { stopCacheFault = null; return; }
+    await guardFaultProfile(cleanup);
+    const current = await faultIO(exists(fault.block), 'Could not inspect the owned Stop fault directory', cleanup);
+    assert.ok(current?.isDirectory() && !current.isSymbolicLink() && fault.identity && current.dev === fault.identity.dev && current.ino === fault.identity.ino,
+      'The owned Stop fault directory changed identity; it will not be removed');
+    assert.ok(samePath(await faultIO(realpath(fault.block), 'Could not resolve the Stop fault directory', cleanup), fault.block), 'The Stop fault path no longer resolves inside the isolated profile');
+    assert.equal((await faultIO(readdir(fault.block), 'Could not inspect Stop fault directory contents', cleanup)).length, 0, 'The owned Stop fault directory is no longer empty');
+    await faultIO(rmdir(fault.block), 'Could not remove the owned empty Stop fault directory', cleanup);
+    fault.owned = false;fault.evidence.directoryRemoved = true;stopCacheFault = null;
+  }
+  async function recoverStopCacheFault(target, required) {
+    const fault = stopCacheFault;assert.equal(fault?.record, target.record, 'Stop fault ownership does not match this cancellation attempt');
+    const record = target.record, transitions = report.stateTransitions.slice(target.stopTransitionStart ?? report.stateTransitions.length);
+    if (required) {
+      await until(() => !!c.state.stopPersistenceError && c.t3StopPersistenceDirty && c.state.stopRetryAvailable && !c.state.stopRequestPending, 5000, 'The real Stop write failure did not expose retryable persistence status');
+      const writeError = await bounded(c.t3SaveQueue.then(() => null, error => error), 2000, 'The injected recovery write did not settle');
+      const actualFault = ['EISDIR', 'EACCES', 'EPERM'].includes(writeError?.code) && (!writeError.path || samePath(writeError.path, fault.block));
+      const view = await until(() => ui(`(() => {
+        const status=document.querySelector('#stop-persistence-status'),stop=document.querySelector('#stop'),notice=document.querySelector('#notice'),r=status?.getBoundingClientRect();
+        return status&&!status.hidden&&r.width>0&&r.height>0&&r.top>=0&&r.bottom<=innerHeight+1&&!notice.hidden&&!stop.disabled&&stop.textContent==='Save Stop recovery'&&document.querySelector('#notice-message').textContent===${JSON.stringify(c.state.stopPersistenceError)}
+          ? {warning:document.querySelector('#notice-message').textContent,status:status.textContent,button:stop.textContent}:false;
+      })()`), 5000, 'The actual Stop UI did not retain its separate persistence warning and recovery-save retry');
+      const revoked = transitions.some(state => state.busy && state.stopping && state.desktopActionsRevoked && state.t3StopIntent?.messageId === target.t3MessageId);
+      const predicates = { actualFilesystemFault:actualFault, immediateRevocation:revoked, actionsStillRevoked:c.desktopActionsRevoked === true, intentCleared:!c.t3StopIntent, idle:!c.state.busy && !c.state.stopping, warningMatches:view.warning === c.state.stopPersistenceError };
+      Object.assign(fault.evidence, { outcome: 'write-rejected-remote-cancellation-confirmed', filesystemCode: writeError?.code, runId: record.runId, cancellationMode: record.mode, desktopActionsRevoked: c.desktopActionsRevoked === true, visibleStatus: view.status, retry: view.button });
+      check('stop-recovery-write-fault', 'A real recovery-write failure does not prevent remote cancellation, local revocation or a visible retry',
+        actualFault && revoked && c.desktopActionsRevoked === true && !c.t3StopIntent && !c.state.busy && !c.state.stopping && view.warning === c.state.stopPersistenceError,
+        'fault-injection-real-filesystem-transport-ui', { runId: record.runId, cancellationMode: record.mode, filesystemCode: writeError?.code, visibleStatus: view.status, retry: view.button, predicates, visibleWarning:view.warning, expectedWarning:c.state.stopPersistenceError });
+      await snapshot('05a-stop-recovery-write-fault.png');
+    } else fault.evidence.outcome = 'not-counted-cancellation-not-exercised';
+    await removeStopCacheFault();
+    if (c.t3StopPersistenceDirty || c.state.stopPersistenceError) {
+      await until(() => !c.state.busy && !c.state.stopping && !c.t3InFlight && !c.t3StopIntent && !c.state.stopRequestPending, 5000, 'Recovery-save retry requires the already confirmed terminal request');
+      const before = { threadId: c.t3ThreadId, runs: [...c.t3Runs.keys()], messages: c.messages.map(message => message.id) };
+      const retry = await ui(`(() => {const stop=document.querySelector('#stop');if(stop.disabled||stop.textContent!=='Save Stop recovery')throw new Error('The production recovery-save retry is unavailable');stop.click();return true;})()`);
+      await until(() => !c.t3StopPersistenceDirty && !c.state.stopPersistenceError && !c.state.stopRetryAvailable && !c.state.stopRequestPending, 5000, 'The production recovery-save retry did not clear the persistence failure');
+      const fileInfo = await faultIO(lstat(fault.file), 'Could not inspect the retried recovery file');
+      assert.ok(fileInfo.isFile() && !fileInfo.isSymbolicLink() && samePath(await faultIO(realpath(fault.file), 'Could not resolve the retried recovery file'), fault.file), 'The retried recovery file is not a normal isolated file');
+      const saved = JSON.parse(await faultIO(readFile(fault.file, 'utf8'), 'Could not read the retried recovery file'));
+      await until(() => ui(`document.querySelector('#stop-persistence-status').hidden&&document.querySelector('#stop').disabled&&document.querySelector('#notice').hidden`), 5000, 'The recovered Stop UI did not clear its warning');
+      const noNewWork = before.threadId === c.t3ThreadId && JSON.stringify(before.runs) === JSON.stringify([...c.t3Runs.keys()]) && JSON.stringify(before.messages) === JSON.stringify(c.messages.map(message => message.id));
+      assert.ok(retry && !saved.stopIntent && saved.threadId === before.threadId && noNewWork && c.desktopActionsRevoked === true, 'Saving Stop recovery changed the real session or left its durable intent behind');
+      fault.evidence.recoveredThroughProductionUI = true;fault.evidence.durableStopIntent = null;
+      if (required) check('stop-recovery-save-retry', 'The production recovery-save retry clears the warning and durable intent without another request', true,
+        'real-ui-filesystem-after-fault-injection', { threadUnchanged: true, noNewWork, durableStopIntent: null, desktopActionsRevoked: c.desktopActionsRevoked });
+    } else assert.equal(required, false, 'The injected Stop write fault disappeared before recovery saving was exercised');
   }
   function runFor(message) {
     return [...c.t3Runs.values()].find(run => run.userMessageId === message.t3MessageId);
@@ -229,11 +315,11 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
   }
 
   try {
-    const expected = resolve(root, 'runtime', 'session-verification');
+    const expected = resolve(await realpath(root), 'runtime', 'session-verification');
     const expectedReal = await realpath(expected);
-    const samePath = value => resolve(value).toLowerCase() === resolve(expectedReal).toLowerCase();
     check('isolated-profile', 'The verifier uses only its dedicated local data profile',
-      samePath(await realpath(c.dataDir)) && samePath(await realpath(app.getPath('userData'))), 'environment', { directory: 'runtime/session-verification' });
+      samePath(expectedReal, expected) && samePath(await realpath(c.dataDir), expectedReal) && samePath(await realpath(app.getPath('userData')), expectedReal), 'environment', { directory: 'runtime/session-verification' });
+    verifiedProfile = expectedReal;
     allowCleanup = true;
     await c.configure({ watching: false, backgroundVision: false, proactive: false, inputMode: 'wispr', spokenReplies: false, control: false, model: 'gpt-6-luna', effort: 'low' });
     c.on('state', stateListener); c.on('delta', deltaListener); c.on('speak', speechListener); c.on('speechFlush', flushListener); c.on('activity', toolListener); stateListener(c.state);
@@ -324,7 +410,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     report.faultInjections.push(staleOriginFault);
     const currentActive=()=>c.state.connection==='connected'&&c.state.busy&&c.t3InFlight&&c.t3RunId===active.runId&&!terminal.has(c.t3Runs.get(active.runId)?.status);
     if(activeRemote&&!terminal.has(activeRemote.status)&&currentActive()){
-      assert.ok(allowCleanup&&samePath(await realpath(c.dataDir)),'The stale-origin transport check requires the validated isolated profile');
+      assert.ok(allowCleanup&&samePath(await realpath(c.dataDir),expectedReal),'The stale-origin transport check requires the validated isolated profile');
       const bridgePath=join(c.dataDir,'desktop-bridge.json');
       assert.equal(resolve(await realpath(bridgePath)).toLowerCase(),resolve(expectedReal,'desktop-bridge.json').toLowerCase(),'Only the isolated desktop bridge configuration may be read');
       const bridge=JSON.parse(await readFile(bridgePath,'utf8'));
@@ -394,6 +480,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
       const record = { attempt, marker: cancelToken, mode: attempt === 1 ? 'streaming' : 'startup', outcome: 'pending' };
       report.cancellationAttempts.push(record);
       const target = { record, startup: attempt === 2, approvalReady: false, stopPromise: null, t3MessageId: null };
+      await armStopCacheFault(record);
       cancellationTarget = target; confirmationResult = null;
       const prompt = attempt === 1
         ? `Write a substantial practical guide of about 1,600 words about setting up a calm, useful desktop workspace. Use twelve sections with several concrete paragraphs per section. Begin the first sentence with ${cancelToken} and immediately continue with useful advice, rather than putting the token on a separate line. Explain tradeoffs, maintenance habits, and specific examples. This is text only: do not use tools, inspect the computer, or change settings. Give the substantive guide itself without a preamble or a promise to continue.`
@@ -452,6 +539,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
         c.confirm(false); await injectedConfirmation;
         record.approvalResult = 'declined by verifier cleanup; not evidence of Stop';
         Object.assign(stopping.entry, { status: stoppedRun.status, cancelled: false, cancellationOutcome: 'not-exercised' });
+        await recoverStopCacheFault(target, false);
         cancellationTarget = null;
         if (attempt === 1) continue;
         break;
@@ -475,6 +563,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
       check('approval-closed', 'Stop declines and hides the injected pending approval',
         record.stopUI.approvalVisible && confirmationResult === 'declined' && c.confirmation === null && await ui('document.querySelector("#confirmation").hidden'),
         'fault-injection-integration', { approval: 'injected on real acceptance; no desktop action', result: confirmationResult });
+      await recoverStopCacheFault(target, true);
       record.outcome = 'cancelled'; record.approvalResult = confirmationResult;
       Object.assign(stopping.entry, { status: stoppedRun.status, cancelled: true });
       cancelledAttempt = record; cancellationTarget = null;
@@ -582,7 +671,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
       5000, 'The real recovered answer did not reach the answer bubble');
     await snapshot('07-recovered-answer-bubble.png', bubble);
     check('session-clean', 'The recovered session is connected and ready with sharing disabled',
-      c.state.connection === 'connected' && !c.state.busy && !c.state.stopping && !c.state.sendPending && !c.t3InFlight && c.confirmation === null && !c.state.error,
+      c.state.connection === 'connected' && !c.state.busy && !c.state.stopping && !c.state.sendPending && !c.t3InFlight && c.confirmation === null && !c.state.error && !c.state.stopPersistenceError && !c.t3StopPersistenceDirty && !stopCacheFault,
       'real-transport-ui', { connection: c.state.connection, busy: c.state.busy, stopping: c.state.stopping });
     check('offline-stop-replay-required', 'The offline Stop scenario supplied actual replay evidence', offlineStopAccepted,
       'real-transport-model', { outcome: offlineRecord.outcome, replayObserved: offlineRecord.replayObserved });
@@ -594,6 +683,8 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     cancellationTarget = null;
     if (offlineStopWatch) { offlineStopWatch.socket.off('close', offlineStopWatch.closedListener); offlineStopWatch = null; }
     if (allowCleanup) {
+      try { await removeStopCacheFault(true); }
+      catch (error) { report.cleanupError = safeError(error); report.success = false; }
       try {
         c.confirm(false);
         await Promise.race([c.configure({ watching: false, backgroundVision: false, proactive: false, inputMode: 'wispr', spokenReplies: false, control: false }), sleep(5000).then(() => { throw new Error('Cleanup settings timed out'); })]);
@@ -620,11 +711,12 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
           report.cleanupRemoteActive = !!remote.thread?.activeRunId || !!remote.runs?.some(run => !terminal.has(run.status));
           if (report.cleanupRemoteActive) throw new Error('A verification model request is still active in T3 after cleanup');
         }
-      } catch (error) { report.cleanupError = safeError(error); report.success = false; }
+      } catch (error) { report.cleanupError = [report.cleanupError, safeError(error)].filter(Boolean).join('; '); report.success = false; }
       report.finalState = { connection: c.state.connection, busy: c.state.busy === true, stopping: c.state.stopping === true,
         sendPending: c.state.sendPending === true, confirmationPending: !!c.confirmation, watching: c.state.watching === true,
-        backgroundVision: c.state.backgroundVision === true, proactive: c.state.proactive === true };
-      if (report.finalState.connection !== 'connected' || report.finalState.busy || report.finalState.stopping || report.finalState.sendPending || report.finalState.confirmationPending || report.finalState.watching || report.finalState.backgroundVision || report.finalState.proactive) report.success = false;
+        backgroundVision: c.state.backgroundVision === true, proactive: c.state.proactive === true,
+        stopPersistenceError: c.state.stopPersistenceError ?? null, stopPersistenceDirty: c.t3StopPersistenceDirty === true, stopFaultDirectoryOwned: stopCacheFault?.owned === true };
+      if (report.finalState.connection !== 'connected' || report.finalState.busy || report.finalState.stopping || report.finalState.sendPending || report.finalState.confirmationPending || report.finalState.watching || report.finalState.backgroundVision || report.finalState.proactive || report.finalState.stopPersistenceError || report.finalState.stopPersistenceDirty || report.finalState.stopFaultDirectoryOwned) report.success = false;
     }
     c.off('state', stateListener); c.off('delta', deltaListener); c.off('speak', speechListener); c.off('speechFlush', flushListener); c.off('activity', toolListener);
     report.elapsedMs = Date.now() - startedAt;

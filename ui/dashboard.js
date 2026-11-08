@@ -10,13 +10,14 @@ const rawRequest = window.companion.request;
 let state = {}, frame = null, sentFrame = null, showSent = false, dirty = false, privacyDirty = false;
 let defaultPrompt = '', modelKey = '', lastScreenTitle = '', lastStateError = '', localPending = false, lastAttempt = null;
 let retryNotice = null, noticeSource = '', following = true, scrollFrame = 0, streamGeneration = -1, initialized = false, scrollIntentUntil = 0;
-let screenCollapsed = false;
+let screenCollapsed = false, stopPending = false, noticeRevision = 0, latestStopId = null;
 try { screenCollapsed = localStorage.getItem('hephaestus.screenPanel') === 'hidden'; } catch { /* The panel still works if local storage is unavailable. */ }
 const messages = new Map();
 const time = value => value == null || !Number.isFinite(new Date(value).getTime()) ? 'Earlier' : new Date(value).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 
 function announce(text) { $('conversation-announcer').textContent = text; }
 function notice(error, {retry = null, title = 'Something needs attention', source = 'local'} = {}) {
+  noticeRevision++;
   $('notice-title').textContent = title;
   $('notice-message').textContent = userErrorMessage(error);
   $('notice').hidden = false;
@@ -24,7 +25,7 @@ function notice(error, {retry = null, title = 'Something needs attention', sourc
   $('notice-retry').hidden = !retry;
   if(source!=='state')$('notice').scrollIntoView({block:'nearest'});
 }
-function hideNotice() { $('notice').hidden = true; retryNotice = null; noticeSource = ''; }
+function hideNotice() { noticeRevision++; $('notice').hidden = true; retryNotice = null; noticeSource = ''; }
 async function perform(command, params, {retry = true} = {}) {
   try { const result = await request(command, params); if (noticeSource === 'action:' + command) hideNotice(); return result; }
   catch (error) { notice(error, {retry:retry ? () => perform(command, params) : null,source:'action:' + command}); renderControls(); return null; }
@@ -82,8 +83,50 @@ function updateComposer() {
   $('send').setAttribute('aria-label',pending ? 'Sending message' : 'Send message');
   $('message-form').setAttribute('aria-busy',String(pending));
   $('compose-hint').textContent = state.instructionsSaving ? 'Saving instructions · your draft stays here' : pending ? 'Sending your message…' : state.connection !== 'connected' ? localCommand ? 'Local command · Enter to send' : 'Reconnecting · your draft stays here' : 'Enter to send · Shift + Enter for a new line';
-  $('stop').disabled = state.stopping === true || !(state.busy === true || state.speaking === true || pending);
-  $('stop').textContent = state.stopping === true ? 'Stopping…' : '■ Stop reply';
+  updateStopControls(pending);
+}
+function updateStopControls(pending = localPending || state.sendPending === true) {
+  const stop = $('stop'), retry = state.stopRetryAvailable === true;
+  const waiting = stopPending || state.stopRequestPending === true;
+  const active = state.busy === true || state.speaking === true || pending;
+  stop.disabled = waiting || (state.stopping === true && !retry) || !(retry || active);
+  stop.textContent = waiting ? 'Stopping…' : retry && state.stopping ? 'Retry Stop' : state.stopping ? 'Stopping…' : active ? '■ Stop reply' : retry ? 'Save Stop recovery' : '■ Stop reply';
+  let status = $('stop-persistence-status');
+  if (!status) { status = document.createElement('span'); status.id = 'stop-persistence-status'; status.setAttribute('role','status'); stop.before(status); }
+  status.hidden = !state.stopPersistenceError;
+  status.textContent = state.stopPersistenceError ? 'Stop recovery not saved' : '';
+  status.title = state.stopPersistenceError ?? '';
+  status.setAttribute('aria-label',state.stopPersistenceError ?? '');
+  stop.title = state.stopPersistenceError ?? (retry ? 'Retry cancellation until T3 confirms the request has stopped.' : '');
+  if (state.stopPersistenceError) stop.setAttribute('aria-describedby',status.id); else stop.removeAttribute('aria-describedby');
+}
+function currentStopRetry() { return state.stopping && state.stopRetryId ? {kind:'cancel',stopId:state.stopRetryId} : {kind:'recovery'}; }
+function stopNoticeRetry(action, owner = latestStopId, kind = 'persistence') {
+  const retry = () => requestStop(action); retry.keepNotice = true; retry.stopOwnerId = owner; retry.stopAction = action; retry.stopNoticeKind = kind; return retry;
+}
+function refreshStopNotice() {
+  const previous = retryNotice;
+  if (noticeSource !== 'action:interrupt' || !previous?.stopOwnerId || previous.stopOwnerId !== latestStopId) return;
+  if (!state.stopPersistenceError) { if (!state.stopping && !state.stopRequestPending) hideNotice(); return; }
+  if (previous.stopNoticeKind !== 'persistence' && state.stopping) return;
+  const action = currentStopRetry();
+  if ($('notice-message').textContent !== state.stopPersistenceError || previous.stopAction.kind !== action.kind || previous.stopAction.stopId !== action.stopId) {
+    notice(new Error(state.stopPersistenceError), {title:'Stop recovery was not saved',retry:stopNoticeRetry(action,previous.stopOwnerId),source:'action:interrupt'});
+  }
+}
+async function requestStop(retryAction = null) {
+  if (stopPending) return;
+  const originalNotice = noticeRevision;
+  stopPending = true; updateComposer();
+  try {
+    const result = await request(retryAction ? 'retry-stop' : 'interrupt',retryAction ?? undefined);
+    if (result?.stale || retryAction && noticeRevision !== originalNotice) return result;
+    const retry = currentStopRetry();
+    if (state.stopPersistenceError) notice(new Error(state.stopPersistenceError), {title:'Stop recovery was not saved',retry:stopNoticeRetry(retry),source:'action:interrupt'});
+    else if (noticeSource === 'action:interrupt') hideNotice();
+    return result;
+  } catch (error) { if (retryAction && noticeRevision !== originalNotice) return; const retry = currentStopRetry(); notice(error, {title:'Stop needs attention',retry:stopNoticeRetry(retry,latestStopId,'cancellation'),source:'action:interrupt'}); }
+  finally { stopPending = false; updateComposer(); }
 }
 function renderControls() {
   $('proactive-shortcut').checked = state.proactive === true;
@@ -96,6 +139,7 @@ function renderControls() {
   updateComposer();
 }
 function render(next) {
+  if (next.stopRetryId) latestStopId = next.stopRetryId;
   state = next; telemetry.updateState(next); runtimeUI.updateState(next); dictation.event('state',next); renderControls();
   $('plan').textContent = next.plan ? `ChatGPT ${next.plan.toUpperCase()}` : next.connection === 'connected' ? 'Codex connected' : 'Connecting';
   const used = next.usage?.primary?.usedPercent;
@@ -109,7 +153,7 @@ function render(next) {
   $('pause').textContent = next.running === true ? 'Pause companion' : 'Resume companion';
   $('pause').setAttribute('aria-pressed',String(next.running !== true));
   const foreground = next.busy === true && next.background !== true;
-  const replyState = next.stopping ? 'Stopping…' : next.sendPending ? 'Sending…' : foreground ? next.activity === 'Waiting for your answer' ? 'Needs your answer' : next.activity === 'Stop not confirmed' ? 'Stop not confirmed' : 'Thinking…' : next.speaking ? 'Speaking' : next.connection === 'connected' ? 'Ready' : 'Connecting';
+  const replyState = next.stopping ? next.activity === 'Stop not confirmed' ? 'Stop not confirmed' : 'Stopping…' : next.sendPending ? 'Sending…' : foreground ? next.activity === 'Waiting for your answer' ? 'Needs your answer' : 'Thinking…' : next.speaking ? 'Speaking' : next.connection === 'connected' ? 'Ready' : 'Connecting';
   $('reply-state').textContent = replyState; $('reply-state').dataset.active = String(foreground || next.sendPending === true);
   const always = next.inputMode === 'always';
   $('listening-label').textContent = next.running !== true ? 'Companion paused' : next.dictating ? 'Listening to your Wispr dictation' : always ? next.listening ? 'Listening when you need me' : next.speech === 'loading' ? 'Preparing local speech' : 'Microphone needs attention' : 'Wispr Flow is ready';
@@ -135,6 +179,7 @@ function render(next) {
   renderScreen();
   if (next.error && next.error !== lastStateError) { lastStateError = next.error; notice(new Error(next.error), {source:'state'}); }
   if (!next.error) { lastStateError = ''; if (noticeSource === 'state') hideNotice(); }
+  refreshStopNotice();
   if (!next.busy && !next.sendPending && !$('reply-draft').hidden && next.error) $('reply-draft').querySelector('.streaming-label').textContent = '· interrupted';
 }
 function canShowScreen() { return state.running === true && state.watching === true && state.screenPrivacyBlocked !== true; }
@@ -249,7 +294,7 @@ $('startup').onchange = () => perform('login-startup',{enabled:$('startup').chec
 $('message-form').onsubmit = event => { event.preventDefault(); dictation.submit(); };
 $('dashboard-input').addEventListener('input',updateComposer);
 $('pause').onclick = () => perform('configure',{running:state.running !== true});
-$('stop').onclick = () => perform('interrupt',undefined,{retry:false});
+$('stop').onclick = () => requestStop(state.stopping || state.stopRetryAvailable && !(state.busy || state.speaking || state.sendPending || localPending) ? currentStopRetry() : null);
 for (const [id,command] of Object.entries({'open-popup':'toggle-bubble',quit:'quit',close:'hide',minimize:'window-minimize',maximize:'window-maximize'})) $(id).onclick = () => perform(command,undefined,{retry:false});
 $('open-voice').onclick = () => navigate('voice'); $('expand-screen').onclick = () => navigate('screen');
 function toggleScreenPanel() {
@@ -264,7 +309,7 @@ toggleScreenPanel();
 for (const id of ['refresh-screen','share-now']) $(id).onclick = async () => { $(id).disabled = true; try { await perform('refresh-screen'); } finally { renderScreen(); } };
 for (const [id,sent] of [['view-live',false],['view-sent',true]]) $(id).onclick = () => { showSent = sent; for (const [key,selected] of [['view-live',!sent],['view-sent',sent]]) { $(key).classList.toggle('selected',selected); $(key).setAttribute('aria-pressed',String(selected)); } renderScreen(); };
 $('notice-dismiss').onclick = () => { hideNotice(); rawRequest('dismiss-error').catch(() => {}); };
-$('notice-retry').onclick = async () => { const retry = retryNotice; if (!retry) return; hideNotice(); await retry(); };
+$('notice-retry').onclick = async () => { const retry = retryNotice; if (!retry) return; if (!retry.keepNotice) hideNotice(); await retry(); };
 $('prompt').oninput = () => { dirty = true; $('prompt-status').textContent = 'Unsaved changes'; $('prompt-count').textContent = `${$('prompt').value.length.toLocaleString()} / 32,000`; };
 $('save-prompt').onclick = async () => {
   const submitted=$('prompt').value;$('save-prompt').disabled=true;$('save-prompt').textContent='Saving…';

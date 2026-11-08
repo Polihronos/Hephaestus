@@ -29,7 +29,7 @@ dynamicTools.push(
 const settingsKeys=['model','effort','watching','backgroundVision','spokenReplies','monitor','prompt','opacity','autoSend','voice','mascotPosition','inputMode','inputDevice','control','proactive','captureMode','backgroundInterval','excludedApps','noticeSnoozeUntil','noticeFeedback'];
 export class Companion extends EventEmitter{
  constructor({root,dataDir,excludePids=[],openBrowser}){super();Object.assign(this,{root,dataDir,excludePids,openBrowser});this.state={name:'Hephaestus',connection:'connecting',plan:null,model:'gpt-6-luna',effort:'low',running:true,watching:true,backgroundVision:true,spokenReplies:false,monitor:-1,busy:false,activity:'Connecting',inputMode:'wispr',inputDevice:'default',control:true,proactive:true,captureMode:'window',backgroundInterval:20000,opacity:1,autoSend:true,voice:'',prompt:'',speech:'off',listening:false,usage:null,error:null,excludedApps:[],noticeSnoozeUntil:0,noticeFeedback:[],screenPrivacyBlocked:false,screenPrivacyReason:null};this.frames=[];this.observations=new Map();this.messages=[];this.activities=[];this.generation=0;this.closed=false;this.lastWatchAt=Date.now();this.spokenHistory=[];}
- publish(extra={}){Object.assign(this.state,extra);this.emit('state',{...this.state});}
+ publish(extra={}){Object.assign(this.state,extra,{voiceEpoch:this.voiceEpoch??0});this.emit('state',{...this.state});}
  message(role,text,extra={}){const m={id:randomUUID(),role,text,at:Date.now(),...extra};this.messages.push(m);this.messages=this.messages.slice(-120);this.emit('message',m);if(this.threadId)this.save().catch(()=>{});return m;}
  async start(){await mkdir(this.dataDir,{recursive:true});this.defaultPrompt=await readFile(join(this.root,'assets','system-prompt.txt'),'utf8');const {settings:s,migration}=await readPromptSettings(join(this.dataDir,'settings.json'),this.defaultPrompt);for(const k of settingsKeys)if(s[k]!==undefined)this.state[k]=s[k];if(!s.defaultsRevision){this.state.inputMode='wispr';this.state.spokenReplies=false;}if(!s.lunaRevision){this.state.model='gpt-6-luna';this.state.effort='low';}this.state.prompt=migration.prompt;this.messages=(s.messages??[]).filter(m=>m&&typeof m.text==='string').slice(-120);for(const m of this.messages)this.emit('message',m);this.savedThread=s.promptVersion===4&&s.performanceRevision===2?s.threadId:null;
   try{this.state.excludedApps=excludedApps(this.state.excludedApps);}catch{this.privacyConfigurationError='Saved app exclusions are invalid; save valid private apps in Settings before sharing your screen';this.state.excludedApps=[];}
@@ -48,19 +48,27 @@ export class Companion extends EventEmitter{
   this.speech.on('ready',m=>this.publish({speech:'ready',speechModel:m.model}));this.speech.on('failed',m=>this.publish({speech:'error',error:m.error}));this.speech.on('fault',e=>this.publish({speech:'error',error:e.message}));
   this.speech.on('disconnected',()=>{this.speech=null;if(!this.closed){this.publish({speech:'loading'});this.speechTimer=setTimeout(()=>this.startSpeech().catch(e=>this.publish({error:e.message})),2000);}});
  }
- async transcribe(audio){
-  if(this.state.inputMode!=='always'||!this.state.running||this.state.dictating||this.state.speech!=='ready')return;
-  if(this.transcribing){this.voiceAudioQueue??=[];if(this.voiceAudioQueue.length<3)this.voiceAudioQueue.push(audio);return;}
-  this.transcribing=true;const epoch=this.voiceEpoch??0;
-  try{const result=await this.speech.call('transcribe',{audio},60000);if(epoch!==(this.voiceEpoch??0)||!this.state.running||this.state.dictating)return;
-   const text=result.text?.trim();if(!text)return;const normalize=s=>s.toLowerCase().replace(/[^a-z0-9 ]/g,'').replace(/\s+/g,' ').trim();const heard=normalize(text);
+ invalidateVoiceInput(){this.voiceEpoch=(this.voiceEpoch??0)+1;this.state.voiceEpoch=this.voiceEpoch;this.state.hearing=false;this.voiceAudioQueue=[];this.voiceDrainPending=null;}
+ drainVoiceAudioQueue(){
+  if(this.closed||this.transcribing||this.voiceDrainPending)return;
+  let next;do{next=this.voiceAudioQueue?.shift();}while(next&&next.epoch!==(this.voiceEpoch??0));
+  if(!next)return;
+  this.voiceDrainPending=next;
+  setImmediate(()=>{if(this.voiceDrainPending!==next)return;this.voiceDrainPending=null;this.transcribe(next.audio,{epoch:next.epoch}).catch(error=>{if(!this.closed&&next.epoch===(this.voiceEpoch??0))this.publish({error:error.message});});});
+ }
+ async transcribe(audio,{epoch=this.voiceEpoch??0}={}){
+  if(this.closed||epoch!==(this.voiceEpoch??0)||this.state.inputMode!=='always'||!this.state.running||this.state.dictating||this.state.speech!=='ready')return;
+  if(this.transcribing||this.voiceDrainPending){this.voiceAudioQueue??=[];if(this.voiceAudioQueue.length<3)this.voiceAudioQueue.push({audio,epoch});return;}
+  this.transcribing=true;
+  try{const result=await this.speech.call('transcribe',{audio},60000);if(this.closed||epoch!==(this.voiceEpoch??0)||this.state.inputMode!=='always'||!this.state.running||this.state.dictating)return;
+   const text=result.text?.trim();if(!text)return;const normalize=s=>s.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{M}\p{N}\s]/gu,'').replace(/\s+/g,' ').trim();const heard=normalize(text);
    const echo=this.spokenHistory.some(s=>Date.now()-s.at<10000&&heard.length>8&&(normalize(s.text).includes(heard)||heard.includes(normalize(s.text))));
    if(echo){this.publish({voiceActivity:'Playback echo rejected'});return;}
    this.publish({lastRecognitionMs:result.elapsedMs});const startedAt=Date.now();this.submit(text,{source:'voice'}).catch(async error=>{
     let message=error.message;try{await preserveFailedVoiceInput(this,{text,source:'voice',error,startedAt});}catch(saveError){message+=' The recognized text could not be saved: '+saveError.message;}
     this.publish({error:message});this.emit('voiceInputFailed');
    });
-  }finally{this.transcribing=false;this.publish({hearing:false});const next=this.voiceAudioQueue?.shift();if(next)setImmediate(()=>this.transcribe(next).catch(e=>this.publish({error:e.message})));}
+  }finally{this.transcribing=false;if(!this.closed)this.publish({hearing:false});this.drainVoiceAudioQueue();}
  }
  scheduleReconnect(){if(this.closed||this.reconnectTimer)return;this.publish({connection:'reconnecting',busy:!!this.t3InFlight&&this.state.busy,activity:'Reconnecting to Codex'});const delay=Math.min(30000,1500*2**(this.reconnectAttempts??0));this.reconnectAttempts=(this.reconnectAttempts??0)+1;this.reconnectTimer=setTimeout(async()=>{this.reconnectTimer=null;if(this.closed)return;this.rpc?.removeAllListeners('disconnected');this.rpc?.close();try{await this.connect();if(!this.closed)this.reconnectAttempts=0;}catch(e){if(this.closed)return;this.publish({error:e.message});this.scheduleReconnect();}},delay);}
  threadParams(){return {cwd:join(this.dataDir,'context'),model:this.state.model,modelProvider:'openai',sandbox:'read-only',approvalPolicy:'never',baseInstructions:this.state.prompt,developerInstructions:'',config:{model_reasoning_effort:this.state.effort,model_reasoning_summary:'auto',project_doc_max_bytes:0},dynamicTools};}
@@ -96,7 +104,16 @@ export class Companion extends EventEmitter{
   this.publish({plan:account.account.planType,models:this.models,...(publishReady?{connection:'connected',activity:'Ready',error:null}:{})});
   if(publishReady)await this.updateUsage();
  }
- async save(options={}){if(this.promptSaveBarrier&&!Object.hasOwn(options,"settings")){await this.promptSaveBarrier;return this.save(options);}const {settings=this.state,threadId=this.threadId??this.savedThread}=options;const s={promptVersion:4,promptDefaultHash:defaultPromptHash(settings.prompt,this.defaultPrompt),defaultsRevision:1,performanceRevision:2,lunaRevision:1,threadId,messages:this.messages};for(const k of settingsKeys)s[k]=settings[k];this.saveQueue=(this.saveQueue??Promise.resolve()).catch(()=>{}).then(async()=>{const tmp=join(this.dataDir,'settings.tmp');await writeFile(tmp,JSON.stringify(s,null,2));await rename(tmp,join(this.dataDir,'settings.json'));}).catch(error=>{throw Object.assign(new Error('Your settings could not be saved. Check free disk space and that the settings folder is writable.',{cause:error}),{code:error.code});});return this.saveQueue;}
+ async save(options={}){
+  if(this.promptSaveBarrier&&!Object.hasOwn(options,'settings')){await this.promptSaveBarrier;return this.save(options);}
+  this.saveQueue=(this.saveQueue??Promise.resolve()).catch(()=>{}).then(async()=>{
+   // Read ordinary state when this write starts, after earlier commits have applied.
+   const settings=typeof options.settings==='function'?options.settings():options.settings??this.state,threadId=options.threadId!==undefined?options.threadId:this.threadId??this.savedThread;
+   const s={promptVersion:4,promptDefaultHash:defaultPromptHash(settings.prompt,this.defaultPrompt),defaultsRevision:1,performanceRevision:2,lunaRevision:1,threadId,messages:this.messages};for(const k of settingsKeys)s[k]=settings[k];
+   const tmp=join(this.dataDir,'settings.tmp');await writeFile(tmp,JSON.stringify(s,null,2));await rename(tmp,join(this.dataDir,'settings.json'));options.onSaved?.(settings);
+   if(this.settingsSaveError&&this.settingsSaveError===this.state.error&&settingsKeys.every(k=>JSON.stringify(settings[k])===JSON.stringify(this.state[k]))){this.settingsSaveError=null;this.publish({error:null});}
+  }).catch(error=>{throw Object.assign(new Error('Your settings could not be saved. Check free disk space and that the settings folder is writable.',{cause:error}),{code:error.code});});return this.saveQueue;
+ }
  async updateUsage(){if(this.state.connection!=='connected')return;const r=await this.rpc.call('account/rateLimits/read',{});this.publish({usage:r.rateLimits});}
  clearScreen(){this.frames=[];this.observations.clear();this.modelObservations?.clear();this.lastModelObservationId=null;this.latest=null;this.attention=null;this.attentionPhysical=null;this.lastWatchFingerprint=null;this.emit('frame',null);this.emit('visionFrame',null);this.emit('annotation',{mark:{kind:'clear'}});}
  blockScreen(reason){this.clearScreen();this.publish({screenPrivacyBlocked:true,screenPrivacyReason:reason,screenWindow:null,captureSource:null,lastVisionAt:null});throw new PrivacyBlockedError(reason);}
@@ -124,7 +141,7 @@ export class Companion extends EventEmitter{
   if(generation!==this.generation||!this.state.running||!this.state.watching)throw new Error('Screen capture was interrupted');
   f.id=randomUUID();return f;
  }
- async sample(){if(this.sampling||!this.state.running||!this.state.watching)return;this.sampling=true;try{const f=await this.captureSafely();this.latest=f;this.frames=[f];this.publish({screenWindow:f.window.title,screenError:null,captureSource:f.captureSource});this.emit('frame',f);}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED'&&e.message!=='Screen capture was interrupted')throw e;}finally{this.sampling=false;}}
+ async sample(){if(this.closed||this.sampling||!this.state.running||!this.state.watching)return;this.sampling=true;try{const f=await this.captureSafely();this.latest=f;this.frames=[f];this.publish({screenWindow:f.window.title,screenError:null,captureSource:f.captureSource});this.emit('frame',f);}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED'&&e.message!=='Screen capture was interrupted')throw e;}finally{this.sampling=false;}}
  async observe(region,options={}){const f=await this.captureSafely(region,options);this.latest=f;this.observations.set(f.id,f);if(this.observations.size>20)this.observations.delete(this.observations.keys().next().value);return f;}
  async safeObservation(region,options={}){return this.observe(region,options);}
  metadata(f){const p=this.attentionPhysical;const attention=p?{x:Math.round((p.x-f.bounds.x)*f.width/f.bounds.width),y:Math.round((p.y-f.bounds.y)*f.height/f.bounds.height),label:p.label}:this.attention??null;return {observationId:f.id,capturedAt:f.capturedAt,image:{width:f.width,height:f.height},pointer:f.cursor,window:f.window,attention};}
@@ -303,8 +320,6 @@ export class Companion extends EventEmitter{
   this.state.noticeFeedback=[...this.state.noticeFeedback.filter(f=>f.id!==id),feedback].slice(-150);message.noticeFeedback=value;this.emit('messageUpdated',{...message});this.publish();await this.save();return this.state;
  }
  async configure(p){
-  if(this.state.instructionsSaving&&p.running===false&&Object.keys(p).length===1){this.state.running=false;await this.interrupt();this.publish();return this.state;}
-  if(this.state.instructionsSaving)throw new Error('Instructions are already being saved. Wait before changing settings.');
   if(p.model!==undefined&&this.models&&!this.models.some(m=>m.id===p.model))throw new Error('Choose an available Codex model');
   if(p.inputMode!==undefined&&!['always','wispr'].includes(p.inputMode))throw new Error('Choose always-on or Wispr input');
   if(p.prompt!==undefined&&(typeof p.prompt!=='string'||!p.prompt.trim()||p.prompt.length>32000))throw new Error('Enter a prompt between 1 and 32,000 characters');
@@ -312,21 +327,46 @@ export class Companion extends EventEmitter{
   if(p.noticeFeedback!==undefined)throw new Error('Use feedback on a notice to update its relevance');
   if(p.captureMode!==undefined&&!['window','monitor'].includes(p.captureMode))throw new Error('Choose window or monitor capture');
   if(p.excludedApps!==undefined)p={...p,excludedApps:excludedApps(p.excludedApps)};
-  const replace=p.prompt!==undefined&&p.prompt!==this.state.prompt;
-  if(replace){
-   if(this.state.connection!=='connected')throw new Error('Wait for the connection to recover before saving instructions. Your edits have not been saved.');
-   const next={...this.state};for(const key of [...settingsKeys,'running'])if(p[key]!==undefined)next[key]=p[key];
-   next.opacity=Math.max(.45,Math.min(1,Number(next.opacity)||1));next.backgroundInterval=Math.max(10000,Math.min(600000,Number(next.backgroundInterval)||20000));
-   let release;this.promptSaveBarrier=new Promise(resolve=>release=resolve);this.publish({instructionsSaving:true});
-   try{await this.replacePrompt(p.prompt,{persist:options=>this.save({settings:next,...options})});}finally{this.promptSaveBarrier=null;this.publish({instructionsSaving:false});release();}
-  }
-  if(p.excludedApps!==undefined)this.privacyConfigurationError=null;
-  for(const k of [...settingsKeys,'running'])if(p[k]!==undefined)this.state[k]=p[k];
-  this.state.opacity=Math.max(.45,Math.min(1,Number(this.state.opacity)||1));this.state.backgroundInterval=Math.max(10000,Math.min(600000,Number(this.state.backgroundInterval)||20000));
-  if(p.running===false||p.inputMode==='wispr')this.voiceEpoch=(this.voiceEpoch??0)+1;
-  if(p.running===false||p.watching===false||p.control===false||this.background&&(p.backgroundVision===false||p.proactive===false||p.noticeSnoozeUntil>Date.now()))await this.interrupt();
+  const instructionEdit=p.prompt!==undefined&&p.prompt!==this.state.prompt,protective={};
+  for(const key of ['running','watching','control','backgroundVision','proactive','autoSend',...(!instructionEdit?['spokenReplies']:[])])if(p[key]===false)protective[key]=false;
+  if(p.inputMode==='wispr')protective.inputMode='wispr';
+  if(p.noticeSnoozeUntil>Date.now()&&p.noticeSnoozeUntil>this.state.noticeSnoozeUntil)protective.noticeSnoozeUntil=p.noticeSnoozeUntil;
+  if(p.excludedApps!==undefined)protective.excludedApps=[...new Set([...this.state.excludedApps,...p.excludedApps])];
+  const onlyProtective=Object.keys(p).every(key=>Object.hasOwn(protective,key));
+  if(this.state.instructionsSaving&&!onlyProtective)throw new Error('Instructions are already being saved. Wait before changing settings.');
+  if(instructionEdit&&this.state.connection!=='connected')throw new Error('Wait for the connection to recover before saving instructions. Your edits have not been saved.');
+  this.settingsSafetyRevisions??={};const revisions={...this.settingsSafetyRevisions};
+  // Revocation must precede both the settings queue and any disk or runtime wait.
+  for(const [key,value]of Object.entries(protective)){this.state[key]=value;revisions[key]=this.settingsSafetyRevisions[key]=(this.settingsSafetyRevisions[key]??0)+1;}
+  if(p.running===false||p.inputMode!==undefined||p.inputDevice!==undefined)this.invalidateVoiceInput();
+  const stopping=p.running===false||p.watching===false||p.control===false||this.background&&(p.backgroundVision===false||p.proactive===false||p.noticeSnoozeUntil>Date.now());
+  const interrupted=stopping?this.interrupt():Promise.resolve();
+  interrupted.catch(()=>{}); // The transaction still awaits this result after any earlier settings write.
   if(p.running===false||p.watching===false||p.excludedApps!==undefined){this.clearScreen();if(!this.state.watching||!this.state.running)this.publish({screenPrivacyBlocked:false,screenPrivacyReason:null,screenWindow:null,captureSource:null});}
-  if(p.inputMode==='always')await this.startSpeech();this.publish();if(!replace)await this.save();if(this.state.running)try{await this.sample();}catch(error){this.publish({screenError:error.message});}return this.state;
+  if(Object.keys(protective).length)this.publish();
+  if(Object.keys(p).length===1&&p.running===false){await interrupted;return this.state;}
+  const patch=()=>Object.fromEntries([...settingsKeys,'running'].filter(key=>p[key]!==undefined&&(this.settingsSafetyRevisions[key]??0)===(revisions[key]??0)).map(key=>[key,p[key]]));
+  const apply=next=>{for(const key of Object.keys(patch()))this.state[key]=next[key];if(p.excludedApps!==undefined)this.privacyConfigurationError=null;};
+  const transaction=async()=>{
+   const replace=p.prompt!==undefined&&p.prompt!==this.state.prompt;
+   const candidate=()=>{const next={...this.state,...patch()};next.opacity=Math.max(.45,Math.min(1,Number(next.opacity)||1));next.backgroundInterval=Math.max(10000,Math.min(600000,Number(next.backgroundInterval)||20000));return next;};
+   try{
+    await interrupted;
+    if(replace){
+     if(this.state.connection!=='connected')throw new Error('Wait for the connection to recover before saving instructions. Your edits have not been saved.');
+     const next=candidate();let release;this.promptSaveBarrier=new Promise(resolve=>release=resolve);this.publish({instructionsSaving:true});
+     try{await this.replacePrompt(p.prompt,{persist:options=>this.save({settings:next,...options})});apply(next);}finally{this.promptSaveBarrier=null;this.publish({instructionsSaving:false});release();}
+    }else{
+     let committed=candidate();await this.save({settings:()=>committed=candidate(),onSaved:apply});apply(committed);
+    }
+   }catch(error){
+    if(Object.keys(protective).some(key=>settingsKeys.includes(key))){const message=error.message+' Your safety changes remain active for this session, but were not saved. Retry before restarting.';this.settingsSaveError=message;this.publish({error:message});throw Object.assign(new Error(message,{cause:error}),{code:error.code});}
+    throw error;
+   }
+   if(p.inputMode==='always'&&this.state.inputMode==='always')await this.startSpeech();this.publish();if(this.state.running)try{await this.sample();}catch(error){this.publish({screenError:error.message});}return this.state;
+  };
+  const update=(this.configureQueue??Promise.resolve()).catch(()=>{}).then(transaction);this.configureQueue=update;
+  try{return await update;}finally{if(this.configureQueue===update)this.configureQueue=null;}
  }
- async close(){this.closed=true;clearInterval(this.screenTimer);clearInterval(this.visionTimer);clearInterval(this.usageTimer);clearTimeout(this.reconnectTimer);clearTimeout(this.bridgeTimer);clearTimeout(this.speechTimer);await this.interrupt();await this.historyImport;await this.saveQueue;await this.ledger?.flush();this.rpc?.close();this.speech?.close();this.bridge?.close();}
+ async close(){this.closed=true;this.invalidateVoiceInput();clearInterval(this.screenTimer);clearInterval(this.visionTimer);clearInterval(this.usageTimer);clearTimeout(this.reconnectTimer);clearTimeout(this.bridgeTimer);clearTimeout(this.speechTimer);try{await this.interrupt();await this.configureQueue?.catch(()=>{});await this.historyImport;await this.saveQueue;await this.ledger?.flush();}finally{this.rpc?.close();this.speech?.close();this.bridge?.close();}}
 }

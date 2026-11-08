@@ -47,16 +47,17 @@ export class T3Companion extends Companion {
    if(projection){this.restoreProjection(projection);this.hasT3History=projection.runs.length>0;if(this.desktopToolVersion!==6&&!this.t3InFlight)await this.reloadDesktopTools(projection);}
   }
   if(!this.t3ThreadId){const r=await t3.call('orchestration.launchThread',{commandId:randomUUID(),projectId:this.t3ProjectId,title:'Hephaestus',modelSelection:this.modelSelection(),runtimeMode:'full-access',interactionMode:'default',workspaceStrategy:{type:'root'}});this.t3ThreadId=r.threadId;this.desktopToolVersion=6;}
-  await this.saveT3();
+  const runtimeIdentitySaved=this.t3StopIntent||this.t3StopPersistenceDirty?await this.persistStopState():(await this.saveT3(),true);
   this.workspace=await new T3Workspace({client:t3,dataDir:this.dataDir,context:()=>this.runtimeContext(),onActivity:e=>this.activityEvent(e)}).start();
   this.stopT3Subscription?.();this.stopT3Subscription=await t3.subscribeReady('orchestration.subscribeThread',{threadId:this.t3ThreadId},item=>this.t3Stream(item),{onError:error=>this.t3SubscriptionFailed(t3,error)});
   if(this.t3StopIntent)await this.replayPendingStop(t3);
+  await this.t3StopPersistencePromise;
   if(this.closed)return;if(!this.t3TransportReady||this.t3!==t3)throw new Error('T3 disconnected before startup completed');
   this.promptRecoveryBlocked=false;
   this.publish({connection:'connected',runtime:'t3',t3ThreadId:this.t3ThreadId,t3Origin:t3.origin,models:this.models,activity:this.t3StopIntent?'Stopping':this.t3InFlight?'Continuing your request':'Ready',stopping:!!this.t3StopIntent,busy:!!this.t3StopIntent||!!this.t3InFlight,error:null});
   await this.updateUsage();
   await this.save();
-  if(this.promptRecovery)await this.finishPromptRecovery();
+  if(this.promptRecovery&&runtimeIdentitySaved)await this.finishPromptRecovery();
  }
  t3SubscriptionFailed(client,error){if(this.closed||this.t3!==client)return;this.t3Disconnected(client);this.publish({error:'The conversation stream disconnected. Reconnecting automatically.'});}
  async finishPromptRecovery(){
@@ -98,6 +99,19 @@ export class T3Companion extends Companion {
   if(!run||intent.runId&&intent.runId!==run.id||!intent.runId&&intent.messageId&&run.userMessageId!==intent.messageId)return;
   intent.runId=run.id;this.t3RunId=run.id;this.ignoredT3Runs??=new Set();this.ignoredT3Runs.add(run.id);
  }
+ persistStopState(){
+  const revision=this.t3StopPersistenceRevision=(this.t3StopPersistenceRevision??0)+1;
+  this.t3StopPersistenceDirty=true;
+  let saved;try{saved=this.saveT3();}catch(error){saved=Promise.reject(error);}
+  const pending=Promise.resolve(saved).then(()=>{
+   if(this.t3StopPersistenceRevision===revision){this.t3StopPersistenceDirty=false;this.publish({stopPersistenceError:null,stopRetryAvailable:!!this.t3StopIntent});}
+   return true;
+  },error=>{
+   if(this.t3StopPersistenceRevision===revision)this.publish({stopPersistenceError:this.t3StopIntent?'Stop recovery could not be saved. Desktop actions remain blocked in this app, but Stop may not survive restarting Hephaestus. Retry Stop before closing.':'The request stopped, but its saved recovery state could not be updated. Retry saving Stop recovery before closing Hephaestus.',stopRetryAvailable:true});
+   return false;
+  });
+  this.t3StopPersistencePromise=pending;return pending;
+ }
  reconcilePendingStop(projection){
   const intent=this.t3StopIntent;if(!intent)return false;
   const runs=projection.runs??[],run=intent.runId?runs.find(r=>r.id===intent.runId):runs.find(r=>r.userMessageId===intent.messageId);
@@ -105,28 +119,30 @@ export class T3Companion extends Companion {
   const active=projection.thread?.activeRunId||runs.some(r=>!terminal.has(r.status));
   if(!(run&&terminal.has(run.status))&&!(intent.sent&&!intent.accepted&&!intent.runId&&!active))return false;
   this.t3StopIntent=null;this.t3Outstanding=null;this.desktopActionsRevoked=true;this.t3InFlight=false;this.externalT3Run=false;this.turnId=null;this.t3Finish?.();
-  this.publish({busy:false,stopping:false,background:false,activity:this.state.connection==='connected'?'Ready':'Reconnecting to T3',error:null});
-  this.saveT3().catch(error=>this.publish({error:'The request stopped, but its saved recovery state could not be updated: '+error.message}));return true;
+  this.publish({busy:false,stopping:false,background:false,activity:this.state.connection==='connected'?'Ready':'Reconnecting to T3',error:null,stopRetryId:null});
+  this.persistStopState();return true;
  }
  replayPendingStop(client=this.t3){
   const intent=this.t3StopIntent;if(!intent)return Promise.resolve({confirmed:true});
-  if(!client||this.t3TransportReady===false)return Promise.resolve({confirmed:false});
+  intent.retryId??=randomUUID();
+  if(!client||this.t3TransportReady===false){this.publish({stopRetryAvailable:true,stopRetryId:intent.retryId});return this.persistStopState().then(()=>({confirmed:false}));}
   if(this.t3StopReplay?.client===client&&this.t3StopReplay.intent===intent)return this.t3StopReplay.promise;
   const replay={client,intent};
+  this.publish({stopRequestPending:true,stopRetryAvailable:true,stopRetryId:intent.retryId});
   replay.promise=(async()=>{
    let transportError;
    try{await client.call('orchestration.dispatchCommand',{type:'thread.stop',commandId:randomUUID(),threadId:intent.threadId,reason:'Interrupted from Hephaestus'});if(this.t3===client&&this.t3StopIntent===intent)intent.sent=true;}catch(error){transportError=error;}
-   if(this.t3!==client||this.t3StopIntent!==intent)return{confirmed:!this.t3StopIntent};
+   if(this.t3!==client||this.t3StopIntent!==intent){await this.t3StopPersistencePromise;return{confirmed:!this.t3StopIntent};}
    try{
     const projection=await client.call('orchestration.getThreadProjection',{threadId:intent.threadId},10000);
-    if(this.t3!==client||this.t3StopIntent!==intent)return{confirmed:!this.t3StopIntent};
-    if(this.reconcilePendingStop(projection))return{confirmed:true};
+    if(this.t3!==client||this.t3StopIntent!==intent){await this.t3StopPersistencePromise;return{confirmed:!this.t3StopIntent};}
+    if(this.reconcilePendingStop(projection)){await this.t3StopPersistencePromise;return{confirmed:true};}
     const run=(projection.runs??[]).find(r=>r.id===intent.runId||!intent.runId&&r.userMessageId===intent.messageId);this.rememberStoppedRun(intent,run);
-    await this.saveT3();if(!transportError)return{confirmed:false};
    }catch(error){transportError??=error;}
-   const error=new Error('Stop could not be confirmed. Hephaestus desktop actions are blocked; it will retry after reconnect. Check the Workspace before starting another request.');
+   await this.persistStopState();if(!transportError)return{confirmed:false};
+   const error=new Error('Stop could not be confirmed. Hephaestus desktop actions are blocked. Retry Stop, or let it retry after reconnect. Check the Workspace before starting another request.');
    if(this.t3StopIntent===intent)this.publish({busy:true,stopping:true,activity:'Stop not confirmed',error:error.message});throw error;
-  })().finally(()=>{if(this.t3StopReplay===replay)this.t3StopReplay=null;});
+  })().finally(()=>{if(this.t3StopReplay===replay){this.t3StopReplay=null;this.publish({stopRequestPending:false,stopRetryAvailable:!!this.t3StopIntent||!!this.t3StopPersistenceDirty});}});
   this.t3StopReplay=replay;return replay.promise;
  }
  beginExternalRun(run){
@@ -297,13 +313,22 @@ export class T3Companion extends Companion {
  async interrupt(){
   if(this.t3InFlight||this.t3Outstanding||this.t3StopIntent){
    const outstanding=this.t3Outstanding??{threadId:this.t3ThreadId,messageId:this.t3MessageId,runId:this.t3RunId};
-   this.t3StopIntent??={...outstanding,requestedAt:Date.now()};this.ignoredT3Runs??=new Set();if(this.t3StopIntent.runId)this.ignoredT3Runs.add(this.t3StopIntent.runId);
+   this.t3StopIntent??={...outstanding,requestedAt:Date.now()};this.t3StopIntent.retryId??=randomUUID();this.ignoredT3Runs??=new Set();if(this.t3StopIntent.runId)this.ignoredT3Runs.add(this.t3StopIntent.runId);
    this.desktopActionsRevoked=true;this.observations.clear();this.generation++;this.emit('silence');this.confirm(false);
    const connected=!!this.t3&&this.state.connection==='connected'&&this.t3TransportReady!==false;
-   this.publish({busy:true,stopping:true,activity:connected?'Stopping':'Waiting to stop after reconnect',error:null});
-   await this.saveT3();if(!connected)return{confirmed:false};return this.replayPendingStop();
+   this.publish({busy:true,stopping:true,activity:connected?'Stopping':'Waiting to stop after reconnect',error:null,stopRetryAvailable:true,stopRetryId:this.t3StopIntent.retryId});
+   // Saving recovery intent must never gate the attempt to cancel the request.
+   const saved=this.persistStopState();
+   try{if(!connected)return{confirmed:false};return await this.replayPendingStop();}finally{await saved;}
   }
+  if(this.t3StopPersistenceDirty){await super.interrupt();await this.persistStopState();return{confirmed:true};}
   return super.interrupt();
+ }
+ async retryStop({kind,stopId}={}){
+  if(kind==='recovery')return{saved:this.t3StopPersistenceDirty?await this.persistStopState():true};
+  if(kind!=='cancel'||typeof stopId!=='string'||!stopId)throw new Error('A specific Stop retry is required');
+  if(this.t3StopIntent?.retryId!==stopId)return{stale:true};
+  return this.interrupt();
  }
  async replacePrompt(prompt,{persist=()=>this.save({settings:{...this.state,prompt}})}={}){
   if(this.updatingPrompt)throw new Error('Instructions are already being saved.');

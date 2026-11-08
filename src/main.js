@@ -70,12 +70,12 @@ function moveAttention({point,label=''}){
  animation=setInterval(()=>{const f=Math.min(1,(Date.now()-started)/duration);mascot.setPosition(Math.round(start[0]+dx*f),Math.round(start[1]+dy*f));if(f===1){clearInterval(animation);deliver('movement',{active:false});safe(companion.configure({mascotPosition:target}));}},24);
 }
 async function installWispr(){if(!companion.bridge)return;const w=await readWisprShortcuts();companion.publish({wispr:w});await companion.bridge.call('input-watch',{bindings:w.bindings});}
-function disarm(){clearTimeout(routeTimer);clearInterval(recordingTimer);dictation.reset();deliver('dictation',{armed:false});companion.voiceEpoch=(companion.voiceEpoch??0)+1;companion.publish({dictating:false,hearing:false});}
+function disarm(){clearTimeout(routeTimer);clearInterval(recordingTimer);dictation.reset();deliver('dictation',{armed:false});companion.invalidateVoiceInput();companion.publish({dictating:false,hearing:false});}
 function released(){dictation.active=false;dictation.sticky=false;companion.publish({dictating:false});deliver('dictationReleased',{});clearTimeout(routeTimer);routeTimer=setTimeout(disarm,12000);}
 async function wisprKey(event){
  const action=dictation.key(event);if(action==='cancel'){disarm();return;}
  if(action==='start'){
-  clearTimeout(routeTimer);clearInterval(recordingTimer);companion.voiceEpoch=(companion.voiceEpoch??0)+1;deliver('silence');companion.publish({dictating:true});
+  clearTimeout(routeTimer);clearInterval(recordingTimer);companion.invalidateVoiceInput();deliver('silence');companion.publish({dictating:true});
   const version=dictation.version,focus=await companion.bridge.call('focus-probe');if(version!==dictation.version||!dictation.active)return;
   const runtimeFocused=runtimeView?.webContents.isFocused()===true;
   const runtimeEditable=runtimeFocused?await runtimeView.webContents.executeJavaScript(`(()=>{const e=document.activeElement;return !!e&&(e.isContentEditable||['TEXTAREA','INPUT'].includes(e.tagName)&&!e.readOnly&&!e.disabled);})()`):false;
@@ -155,14 +155,15 @@ async function boot(){
     throw error;
    }
   }
-  if(command==='audio'&&sender===mascot){const bytes=Buffer.from(params.audio);if(bytes.length>16000*32*4)throw new Error('Audio segment too long');safe(companion.transcribe(bytes.toString('base64')));return;}
+  if(command==='audio'&&sender===mascot){if(!Number.isSafeInteger(params.epoch)||params.epoch!==(companion.voiceEpoch??0))return;const bytes=Buffer.from(params.audio);if(bytes.length>16000*32*4)throw new Error('Audio segment too long');safe(companion.transcribe(bytes.toString('base64'),{epoch:params.epoch}));return;}
   if(command==='voice-status'&&sender===mascot){companion.publish({listening:params.active===true,echoCancellation:params.echoCancellation??null,voiceError:params.error??null,...(!params.active?{hearing:false}:{})});return;}
   if(command==='voice-level'&&sender===mascot){send(dashboard,'voiceLevel',params);return;}
-  if(command==='voice-start'&&sender===mascot){companion.publish({hearing:true});deliver('silence');return;}
-  if(command==='voice-idle'&&sender===mascot){if(!companion.transcribing)companion.publish({hearing:false});return;}
+  if(command==='voice-start'&&sender===mascot){if(params.epoch!==(companion.voiceEpoch??0))return;companion.publish({hearing:true});deliver('silence');return;}
+  if(command==='voice-idle'&&sender===mascot){if(params.epoch!==(companion.voiceEpoch??0))return;if(!companion.transcribing)companion.publish({hearing:false});return;}
   if(command==='dictation-complete'&&dictation.armed){released();return;}
   if(command==='talking'&&sender===mascot){if(companion.state.speaking!==(params.active===true))companion.publish({speaking:params.active===true});if(params.text){companion.spokenHistory.push({text:String(params.text),at:Date.now()});companion.spokenHistory=companion.spokenHistory.slice(-8);}if(params.error)companion.publish({error:'Speech: '+params.error});return;}
   if(command==='interrupt'){disarm();return companion.interrupt();}
+  if(command==='retry-stop'){if(!companion.retryStop)throw new Error('This runtime has no pending Stop recovery');return companion.retryStop(params);}
   if(command==='confirm')return companion.confirm(params.approved===true);
   if(command==='show-dashboard')return showDashboard(params.page??'companion',params.focusInput===true);
   if(command==='toggle-bubble'){if(bubble.isVisible())dismissBubble();else{popupSuppressed=false;showBubble();}return;}
