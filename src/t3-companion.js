@@ -374,9 +374,11 @@ export class T3Companion extends Companion {
  }
  async close(){
   this.closed=true;clearTimeout(this.reconnectTimer);this.reconnectTimer=null;
+  this.invalidateVoiceInput();this.publish({running:false,listening:false,hearing:false});
+  await this.configureQueue?.catch(()=>{});
   this.workspace?.close();
   try{await this.interrupt();}catch{/* Local actions were revoked even when remote cancellation is unavailable. */}
   this.stopT3Subscription?.();
-  try{await this.t3?.close();}finally{this.t3=null;this.t3InFlight=false;await super.close();this.desktopServer?.close();}
+  try{await this.t3?.close();}finally{this.t3=null;this.t3InFlight=false;try{await super.close();}finally{this.desktopServer?.close();}}
  }
 }

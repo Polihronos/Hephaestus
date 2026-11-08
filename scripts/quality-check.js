@@ -98,6 +98,48 @@ export async function qualityCheck({ dashboard, mascot, bubble, companion: c, ro
     report.ordinarySettings=await verifyOrdinarySettings({root,companion:c,dashboard,mascot,showDashboard,out});
     for(const name of report.ordinarySettings.checks)check(name,true);
     report.screenshots.push(...report.ordinarySettings.screenshots);
+    const warningBefore={bounds:dashboard.getBounds(),minimum:dashboard.getMinimumSize(),messages:c.messages.map(message=>message.id),runs:[...c.t3Runs.keys()],view:await dashboard.webContents.executeJavaScript(`({draft:document.querySelector('#dashboard-input').value,expanded:document.querySelector('#toggle-screen').getAttribute('aria-expanded')})`)};
+    const layoutWarning='Layout verification only. Stop recovery could not be saved. Desktop actions remain blocked in this app, but Stop may not survive restarting Hephaestus. Retry saving Stop recovery before closing.';
+    report.warningLayout={kind:'injected renderer state event',genuineCancellation:false,retryNotClicked:true,syntheticUnsentDraft:true,exactClientViewport:true,originalMinimum:warningBefore.minimum,layouts:[]};
+    assert.ok(!c.state.error&&!c.state.stopPersistenceError&&!c.state.busy,'Warning layout verification requires the preceding settings checks to finish cleanly');
+    try{
+      // Windows applies native minimum constraints outside the client viewport.
+      // Suspend that constraint only while verifying exact client dimensions.
+      dashboard.setMinimumSize(0,0);
+      await dashboard.webContents.executeJavaScript(String.raw`(()=>{const input=document.querySelector('#dashboard-input');input.value=Array(6).fill('Layout verification only. This draft is not sent.').join('\n');input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+      for(const[width,height]of[[960,620],[1280,840]])for(const mode of['split','expanded']){
+        dashboard.setContentSize(width,height);await showDashboard('companion');
+        await dashboard.webContents.executeJavaScript(`(()=>{const button=document.querySelector('#toggle-screen');if((button.getAttribute('aria-expanded')==='false')!==${mode==='expanded'})button.click();})()`);
+        // Exercise the production renderer's warning and recovery controls. This
+        // labelled event does not change core Stop state, files or any request.
+        c.emit('state',{...c.state,error:layoutWarning,stopPersistenceError:layoutWarning,stopRetryAvailable:true,stopRequestPending:false});
+        const pending=report.warningLayout.pending={requested:{width,height,mode},calibration:[]};
+        try{await until(async()=>{
+          await dashboard.webContents.executeJavaScript('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+          pending.window={bounds:dashboard.getBounds(),contentBounds:dashboard.getContentBounds(),size:dashboard.getSize(),contentSize:dashboard.getContentSize(),zoom:dashboard.webContents.getZoomFactor()};
+          pending.renderer=await dashboard.webContents.executeJavaScript(`({innerWidth,innerHeight,outerWidth,outerHeight,scale:devicePixelRatio,noticeHidden:document.querySelector('#notice').hidden,warning:document.querySelector('#notice-message').textContent,recovery:document.querySelector('#stop').textContent,geometry:window.hephaestusDashboardLayout()})`);
+          pending.predicates={width:pending.renderer.innerWidth===width,height:pending.renderer.innerHeight===height,warningVisible:!pending.renderer.noticeHidden,warningMatches:pending.renderer.warning===layoutWarning};
+          if((!pending.predicates.width||!pending.predicates.height)&&pending.calibration.length<3){const before=dashboard.getSize(),next=[before[0]+width-pending.renderer.innerWidth,before[1]+height-pending.renderer.innerHeight];pending.calibration.push({before,viewport:{width:pending.renderer.innerWidth,height:pending.renderer.innerHeight},next});dashboard.setSize(...next);return false;}
+          return Object.values(pending.predicates).every(Boolean);
+        },3000,'The warning layout did not receive its actual window size and state event');}
+        catch(error){const name=`warning-layout-${width}-${mode}-failed.png`;await writeFile(join(out,name),(await dashboard.webContents.capturePage()).toPNG());report.screenshots.push(name);throw new Error(error.message+' '+JSON.stringify({window:pending.window,renderer:{innerWidth:pending.renderer?.innerWidth,innerHeight:pending.renderer?.innerHeight,noticeHidden:pending.renderer?.noticeHidden},predicates:pending.predicates}),{cause:error});}
+        await dashboard.webContents.executeJavaScript('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+        const geometry=await dashboard.webContents.executeJavaScript('window.hephaestusDashboardLayout()'),name=`warning-layout-${width}-${mode}.png`;
+        report.warningLayout.layouts.push({width,height,mode,window:pending.window,calibration:pending.calibration,...geometry});delete report.warningLayout.pending;await writeFile(join(out,name),(await dashboard.webContents.capturePage()).toPNG());report.screenshots.push(name);
+        check(`Warning, composer, Send and recovery stay visible at ${width}×${height} (${mode})`,geometry.content.noOverflow&&geometry.warning.visible&&geometry.warning.fullText&&geometry.warning.lines>=2&&geometry.warningActions.visible&&geometry.warningDismiss.visible&&geometry.composer.visible&&geometry.input.visible&&geometry.send.visible&&!geometry.send.disabled&&geometry.recovery.visible&&!geometry.recovery.disabled&&geometry.recovery.text==='Save Stop recovery'&&geometry.screenControlsVisible);
+      }
+      assert.ok(JSON.stringify(warningBefore.messages)===JSON.stringify(c.messages.map(message=>message.id))&&JSON.stringify(warningBefore.runs)===JSON.stringify([...c.t3Runs.keys()]),'Warning layout verification must not create messages or model requests');
+    }finally{
+      c.emit('state',{...c.state});const restoration=report.warningLayout.restoration={boundsBefore:warningBefore.bounds,minimumBefore:warningBefore.minimum,calibration:[]};let requested={...warningBefore.bounds};
+      try{for(let attempt=0;attempt<4;attempt++){
+        dashboard.setBounds(requested);await dashboard.webContents.executeJavaScript('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');const actual=dashboard.getBounds();
+        if(JSON.stringify(actual)===JSON.stringify(warningBefore.bounds))break;
+        restoration.calibration.push({requested:{...requested},actual});requested=Object.fromEntries(Object.keys(requested).map(key=>[key,requested[key]+warningBefore.bounds[key]-actual[key]]));
+      }}finally{dashboard.setMinimumSize(...warningBefore.minimum);}
+      await dashboard.webContents.executeJavaScript(`(()=>{const button=document.querySelector('#toggle-screen');if(button.getAttribute('aria-expanded')!==${JSON.stringify(warningBefore.view.expanded)})button.click();const input=document.querySelector('#dashboard-input');input.value=${JSON.stringify(warningBefore.view.draft)};input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+      Object.assign(restoration,{boundsAfter:dashboard.getBounds(),minimumAfter:dashboard.getMinimumSize()});
+      assert.deepEqual(report.warningLayout.restoration.boundsAfter,warningBefore.bounds,'Warning verification did not restore native window bounds');assert.deepEqual(report.warningLayout.restoration.minimumAfter,warningBefore.minimum,'Warning verification did not restore native minimum size');
+    }
     await showDashboard('companion');
     const messagesBeforeLong=c.messages.length,runsBeforeLong=c.t3Runs.size;
     await dashboard.webContents.executeJavaScript(String.raw`(()=>{const input=document.querySelector('#dashboard-input');input.value='  '+'Я'.repeat(16001)+'\n';input.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#message-form').requestSubmit();})()`);

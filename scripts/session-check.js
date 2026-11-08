@@ -202,6 +202,25 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
       check('stop-recovery-write-fault', 'A real recovery-write failure does not prevent remote cancellation, local revocation or a visible retry',
         actualFault && revoked && c.desktopActionsRevoked === true && !c.t3StopIntent && !c.state.busy && !c.state.stopping && view.warning === c.state.stopPersistenceError,
         'fault-injection-real-filesystem-transport-ui', { runId: record.runId, cancellationMode: record.mode, filesystemCode: writeError?.code, visibleStatus: view.status, retry: view.button, predicates, visibleWarning:view.warning, expectedWarning:c.state.stopPersistenceError });
+      const warningLayoutBefore={bounds:dashboard.getBounds(),minimum:dashboard.getMinimumSize(),expanded:await ui(`document.querySelector('#toggle-screen').getAttribute('aria-expanded')`)};
+      try{
+        dashboard.setMinimumSize(0,0);
+        for(const[width,height]of[[960,620],[1280,840]])for(const mode of['split','expanded']){
+          dashboard.setContentSize(width,height);await showDashboard('companion');
+          await ui(`(()=>{const button=document.querySelector('#toggle-screen');if((button.getAttribute('aria-expanded')==='false')!==${mode==='expanded'})button.click();})()`);
+          const sizing={requested:{width,height},calibration:[]};
+          try{await until(async()=>{await frames();sizing.window={bounds:dashboard.getBounds(),contentBounds:dashboard.getContentBounds()};sizing.viewport=await ui('({width:innerWidth,height:innerHeight,scale:devicePixelRatio})');if(sizing.viewport.width===width&&sizing.viewport.height===height)return true;if(sizing.calibration.length<3){const before=dashboard.getSize(),next=[before[0]+width-sizing.viewport.width,before[1]+height-sizing.viewport.height];sizing.calibration.push({before,viewport:sizing.viewport,next});dashboard.setSize(...next);}return false;},3000,'The real Stop warning window did not finish exact client sizing');}
+          catch(error){report.stopWarningLayoutFailure={mode,...sizing};await snapshot(`05a-stop-warning-${width}-${mode}-sizing-failed.png`);throw error;}
+          const geometry=await ui('window.hephaestusDashboardLayout()');await snapshot(`05a-stop-warning-${width}-${mode}.png`);
+          check(`stop-warning-layout-${width}-${mode}`,`The real Stop warning, retry, composer and Send fit ${width}×${height} (${mode})`,
+            geometry.content.noOverflow&&geometry.warning.visible&&geometry.warning.fullText&&geometry.warningActions.visible&&!geometry.warningRetry.hidden&&geometry.warningRetry.visible&&geometry.warningDismiss.visible&&geometry.composer.visible&&geometry.input.visible&&geometry.send.visible&&geometry.recovery.visible&&!geometry.recovery.disabled&&geometry.screenControlsVisible,
+            'real-ui-after-filesystem-transport-fault',{runId:record.runId,width,height,mode,sizing,geometry});
+        }
+      }finally{
+        const restoration=report.stopWarningLayoutRestoration={boundsBefore:warningLayoutBefore.bounds,minimumBefore:warningLayoutBefore.minimum,calibration:[]};let requested={...warningLayoutBefore.bounds};
+        try{for(let attempt=0;attempt<4;attempt++){dashboard.setBounds(requested);await frames();const actual=dashboard.getBounds();if(JSON.stringify(actual)===JSON.stringify(warningLayoutBefore.bounds))break;restoration.calibration.push({requested:{...requested},actual});requested=Object.fromEntries(Object.keys(requested).map(key=>[key,requested[key]+warningLayoutBefore.bounds[key]-actual[key]]));}}finally{dashboard.setMinimumSize(...warningLayoutBefore.minimum);}
+        await ui(`(()=>{const button=document.querySelector('#toggle-screen');if(button.getAttribute('aria-expanded')!==${JSON.stringify(warningLayoutBefore.expanded)})button.click();})()`);await frames();Object.assign(restoration,{boundsAfter:dashboard.getBounds(),minimumAfter:dashboard.getMinimumSize()});assert.deepEqual(restoration.boundsAfter,warningLayoutBefore.bounds,'The Stop warning did not restore native window bounds');assert.deepEqual(restoration.minimumAfter,warningLayoutBefore.minimum,'The Stop warning did not restore native minimum size');
+      }
       await snapshot('05a-stop-recovery-write-fault.png');
     } else fault.evidence.outcome = 'not-counted-cancellation-not-exercised';
     await removeStopCacheFault();

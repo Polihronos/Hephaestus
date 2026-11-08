@@ -346,3 +346,18 @@ async function initialize() {
 }
 await initialize();
 window.hephaestusDashboardInspect = () => ({page:document.querySelector('[data-view]:not([hidden])')?.dataset.view,screenVisible:!$('screen-preview').hidden && !$('screen-context').hidden,screenCollapsed,frameAt:frame?.capturedAt,source:frame?.captureSource,imageWidth:frame?.width,prompt:$('prompt').value,input:dictation.inspect(),answers:messages.size,initialized,sendPending:localPending || state.sendPending === true,following,noticeVisible:!$('notice').hidden});
+window.hephaestusDashboardLayout = () => {
+  const content=document.querySelector('.content'),clip=content.getBoundingClientRect();
+  const bounds=(element,inContent=true)=>{
+    const r=element.getBoundingClientRect();return {left:r.left,top:r.top,right:r.right,bottom:r.bottom,width:r.width,height:r.height,
+      visible:r.width>0&&r.height>0&&r.left>=-1&&r.right<=innerWidth+1&&r.top>=(inContent?clip.top:0)-1&&r.bottom<=(inContent?clip.bottom:innerHeight)+1};
+  };
+  const warning=$('notice'),text=$('notice-message'),retry=$('notice-retry'),stop=$('stop');
+  return {viewport:{width:innerWidth,height:innerHeight,scale:devicePixelRatio},expanded:$('toggle-screen').getAttribute('aria-expanded')==='false',
+    content:{height:content.clientHeight,scrollHeight:content.scrollHeight,scrollTop:content.scrollTop,noOverflow:content.scrollHeight<=content.clientHeight+1&&content.scrollTop<=1},
+    warning:{...bounds(warning),lines:Math.round(text.clientHeight/parseFloat(getComputedStyle(text).lineHeight)),fullText:text.scrollHeight<=text.clientHeight+1&&text.scrollWidth<=text.clientWidth+1&&bounds(text).visible},
+    warningActions:bounds(warning.querySelector('.notice-actions')),warningRetry:{hidden:retry.hidden,...bounds(retry)},warningDismiss:bounds($('notice-dismiss')),
+    composer:bounds($('message-form')),input:bounds($('dashboard-input')),send:{...bounds($('send')),disabled:$('send').disabled},
+    recovery:{...bounds(stop,false),disabled:stop.disabled,text:stop.textContent},
+    screenControlsVisible:$('screen-context').hidden||['captureMode','monitor','refresh-screen','last-vision'].every(id=>bounds($(id)).visible)};
+};

@@ -12,11 +12,15 @@ The dashboard contains the live view, both sides of the conversation, voice sett
 
 The supplied sprite pack provides idle, hammering and eight walking animations. Dragging Hephaestus moves the answer bubble with him. The bubble shows his answers, thinking dots and speaking animation. It contains no transcript or message entry. Clicking elsewhere dismisses it. Screenshot protection is disabled, so normal screenshots can include him.
 
-Hephaestus can selectively point out useful things with temporary highlights and spontaneous observations. **Let Hephaestus notice things** controls that behavior. Manual drawing is not required. App controls operate on direct requests: click, type, scroll, change tabs, focus windows, and navigate the desktop. Stop interrupts a pending sequence; ambiguous consequential actions can request confirmation.
+Hephaestus can selectively point out useful things with temporary highlights and spontaneous observations. **Proactive** on the Companion page, or **Proactive observations** under What I see, controls that behavior. Manual drawing is not required. App controls operate on direct requests: click, type, scroll, change tabs, focus windows, and navigate the desktop. Stop interrupts a pending sequence; ambiguous consequential actions can request confirmation.
 
 The conversation can take the full dashboard width with **Hide screen**. Streaming replies stay in the conversation; reading older messages preserves your position and offers **Latest** to catch up. Messages stay in the composer until their dispatch is acknowledged, and a failed send remains available for review and retry. Reconnection restores active work and missing replies from the runtime. **Stop** reports whether cancellation is confirmed; local desktop actions are revoked immediately even if the runtime cannot confirm the stop.
 
-Messages over 16,000 characters are rejected visibly and remain intact for editing. Failed intentional dictation is saved as a recoverable request in the dashboard. Instruction changes wait for confirmed cancellation before replacing the active conversation. Upgrades replace a previous default prompt only when its exact known fingerprint matches; custom instructions remain unchanged.
+If cancellation is not confirmed, **Retry Stop** retries the original request. After the reply has stopped, **Save Stop recovery** retries saving its recovery record for the next startup. Recovery-save retries do not cancel a newer request. A recovery-write error does not prevent Hephaestus from requesting cancellation while connected.
+
+Settings that enable speech or app control take effect after a successful save. Failed changes stay inactive. Turning off screen sharing, control or microphone input takes effect immediately; if that change cannot be saved, the app explains that it remains active for this session and offers a retry. Save it successfully before restarting to keep that preference.
+
+Messages over 16,000 characters are rejected visibly and remain intact for editing. Failed intentional dictation is saved as a recoverable request in the dashboard. Instruction changes wait for confirmed cancellation before replacing the active conversation. Quitting waits for an Instructions save already in progress before closing its runtime connection. Upgrades replace a previous default prompt only when its exact known fingerprint matches; custom instructions remain unchanged.
 
 ## Attention and screen privacy
 
@@ -33,6 +37,8 @@ Messages over 16,000 characters are rejected visibly and remain intact for editi
 **Wispr Flow** keeps the existing dictation shortcut. The installed shortcut configuration is read without changing it. A focused external text field keeps dictation. Otherwise, Hephaestus focuses a small invisible input in his overlay, accepts Flow’s normal text insertion and sends it after it settles. Turn off automatic sending to review in the dashboard instead. While Flow is dictating, local transcription is suspended to avoid duplicate requests. Flow’s audio processing remains its own.
 
 Neither mode mutes system output. No microphone audio is played back. Raw microphone segments stay local; recognized text and selected screen images go through the signed-in service. There is no new inference API key or separate inference subscription.
+
+Pausing, changing the microphone or input mode, and starting a Wispr dictation discard audio from the previous listening session. Resuming does not replay queued voice commands. An input method can finish composing text with Enter without sending the unfinished draft.
 
 | Shortcut | Action |
 | --- | --- |
@@ -83,13 +89,17 @@ Setup installs local transcription dependencies, verifies the public speech mode
 
 Quit Hephaestus before running the installer for an update. Its preflight rejects a running installation before copying files. Interrupted runtime or speech-model downloads are verified and retried; incomplete files are never promoted into the installation.
 
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-local.ps1
+```
+
 `node scripts/launch.cjs --hephaestus-check` verifies the dashboard, supplied sprite, real microphone echo mode, audible playback rejection, actual speech, popup attachment and dismissal, and a real model-controlled click in a temporary verification window. `--t3-check` verifies Luna through the real T3 runtime, inherited and desktop tools, native typing, proactive notices, Markdown, usage records, and the embedded workspace. Reports and actual screenshots go under `artifacts/`.
 
 `node scripts/launch.cjs --route-check` checks native focus, armed dictation routing, duplicate protection and recovery of unsent text through the actual windows and input handlers. It uses a separate `runtime/route-verification` profile with sharing, background inference and microphone listening disabled. Text insertion and the model submission boundary are simulated and labelled in its report; this does not establish human speech accuracy or Wispr's own transcription quality. It exits after verification and returns a nonzero exit code on failure.
 
 `node scripts/launch.cjs --quality-check-fast` checks the actual production windows at 960x620 and 1280x840, screen-pause behavior, navigation, and microphone defaults without model inference. `--quality-check` adds real local-command measurements, contextual replies, native typing through the conversation runtime, and snapshot reconciliation. These checks use a separate `runtime/quality-verification` data directory; they do not reset the normal application settings or conversation. The full check needs the signed-in allowance and briefly opens an input-verification window. Unit tests use isolated fixtures and do not require a signed-in account. The Windows build and automated tests also run in GitHub Actions.
 
-`node scripts/launch.cjs --session-check` exercises actual UI sends, connection loss during a reply, missing-reply reconciliation, cancellation and a subsequent request in a separate `runtime/session-verification` profile. It uses real model replies; its missing-cache-entry and action-free approval fault injections are labelled in the report. Screenshots, transcripts and token data are not fabricated. These short checks do not establish human speech accuracy or all-day proactive usefulness. Verification failures return a nonzero exit code.
+`node scripts/launch.cjs --session-check` exercises actual UI sends, connection loss during a reply, missing-reply reconciliation, cancellation and a subsequent request in a separate `runtime/session-verification` profile. It also blocks an owned recovery-write path during real cancellation and checks the production recovery-save retry. It uses real model replies; filesystem, missing-cache-entry and action-free approval fault injections are labelled in the report. Screenshots, transcripts and token data are not fabricated. These short checks do not establish human speech accuracy or all-day proactive usefulness. Verification failures return a nonzero exit code.
 
 ## License
 

@@ -29,7 +29,7 @@ dynamicTools.push(
 const settingsKeys=['model','effort','watching','backgroundVision','spokenReplies','monitor','prompt','opacity','autoSend','voice','mascotPosition','inputMode','inputDevice','control','proactive','captureMode','backgroundInterval','excludedApps','noticeSnoozeUntil','noticeFeedback'];
 export class Companion extends EventEmitter{
  constructor({root,dataDir,excludePids=[],openBrowser}){super();Object.assign(this,{root,dataDir,excludePids,openBrowser});this.state={name:'Hephaestus',connection:'connecting',plan:null,model:'gpt-6-luna',effort:'low',running:true,watching:true,backgroundVision:true,spokenReplies:false,monitor:-1,busy:false,activity:'Connecting',inputMode:'wispr',inputDevice:'default',control:true,proactive:true,captureMode:'window',backgroundInterval:20000,opacity:1,autoSend:true,voice:'',prompt:'',speech:'off',listening:false,usage:null,error:null,excludedApps:[],noticeSnoozeUntil:0,noticeFeedback:[],screenPrivacyBlocked:false,screenPrivacyReason:null};this.frames=[];this.observations=new Map();this.messages=[];this.activities=[];this.generation=0;this.closed=false;this.lastWatchAt=Date.now();this.spokenHistory=[];}
- publish(extra={}){Object.assign(this.state,extra,{voiceEpoch:this.voiceEpoch??0});this.emit('state',{...this.state});}
+ publish(extra={}){Object.assign(this.state,extra,{voiceEpoch:this.voiceEpoch??0},this.closed?{running:false,listening:false,hearing:false}:{});this.emit('state',{...this.state});}
  message(role,text,extra={}){const m={id:randomUUID(),role,text,at:Date.now(),...extra};this.messages.push(m);this.messages=this.messages.slice(-120);this.emit('message',m);if(this.threadId)this.save().catch(()=>{});return m;}
  async start(){await mkdir(this.dataDir,{recursive:true});this.defaultPrompt=await readFile(join(this.root,'assets','system-prompt.txt'),'utf8');const {settings:s,migration}=await readPromptSettings(join(this.dataDir,'settings.json'),this.defaultPrompt);for(const k of settingsKeys)if(s[k]!==undefined)this.state[k]=s[k];if(!s.defaultsRevision){this.state.inputMode='wispr';this.state.spokenReplies=false;}if(!s.lunaRevision){this.state.model='gpt-6-luna';this.state.effort='low';}this.state.prompt=migration.prompt;this.messages=(s.messages??[]).filter(m=>m&&typeof m.text==='string').slice(-120);for(const m of this.messages)this.emit('message',m);this.savedThread=s.promptVersion===4&&s.performanceRevision===2?s.threadId:null;
   try{this.state.excludedApps=excludedApps(this.state.excludedApps);}catch{this.privacyConfigurationError='Saved app exclusions are invalid; save valid private apps in Settings before sharing your screen';this.state.excludedApps=[];}
@@ -178,6 +178,7 @@ export class Companion extends EventEmitter{
  }
  assertModelAvailable(){if(this.state.connection!=='connected')throw new Error('Codex is reconnecting. Your input remains available to retry.');if(this.state.stopping||this.desktopActionsRevoked&&this.t3InFlight)throw new Error('The previous request has not stopped yet. Your message has not been sent.');if([this.state.usage?.primary,this.state.usage?.secondary].some(w=>w?.usedPercent>=100))throw new Error('Your included Codex allowance is used up. Wait for its reset.');}
  async submit(text,{source='text',onAccepted}={}){
+  if(this.closed)throw new Error('Hephaestus is closing. Your message has not been sent.');
   text=String(text);if(text.length>MAX_MESSAGE_LENGTH){const error=new RangeError(`Message exceeds the ${MAX_MESSAGE_LENGTH.toLocaleString('en-US')}-character limit (received ${text.length.toLocaleString('en-US')}). Shorten it and try again; nothing was sent.`);error.code='MESSAGE_TOO_LONG';error.limit=MAX_MESSAGE_LENGTH;error.length=text.length;throw error;}if(!text.trim())return;
   const fast=fastCommand(text),request=this.submitSequence=(this.submitSequence??0)+1;
   if((this.state.instructionsSaving||this.promptRecoveryBlocked)&&!['stop','mute'].includes(fast?.kind))throw new Error('Instructions are still being saved or recovered. Your message has not been sent.');
@@ -320,6 +321,7 @@ export class Companion extends EventEmitter{
   this.state.noticeFeedback=[...this.state.noticeFeedback.filter(f=>f.id!==id),feedback].slice(-150);message.noticeFeedback=value;this.emit('messageUpdated',{...message});this.publish();await this.save();return this.state;
  }
  async configure(p){
+  if(this.closed)throw new Error('Hephaestus is closing. Your settings have not been changed.');
   if(p.model!==undefined&&this.models&&!this.models.some(m=>m.id===p.model))throw new Error('Choose an available Codex model');
   if(p.inputMode!==undefined&&!['always','wispr'].includes(p.inputMode))throw new Error('Choose always-on or Wispr input');
   if(p.prompt!==undefined&&(typeof p.prompt!=='string'||!p.prompt.trim()||p.prompt.length>32000))throw new Error('Enter a prompt between 1 and 32,000 characters');
