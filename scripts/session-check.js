@@ -29,7 +29,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
   };
   let phase = 'setup', previousStateKey = '', confirmationResult = null, injectedConfirmation = null;
   let observedClient = c.t3, transportEpoch = 0;
-  let cancellationTarget = null, offlineStopWatch = null, offlineStopAccepted = false;
+  let cancellationTarget = null, offlineStopWatch = null, offlineStopAccepted = false, retainedStoppedReply = null;
   let verifiedProfile = null, stopCacheFault = null;
   const deltas = [], privacyViolations = [], toolEvents = [];
   let speechEvents = 0, flushEvents = 0, allowCleanup = false;
@@ -584,14 +584,21 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
         'fault-injection-integration', { approval: 'injected on real acceptance; no desktop action', result: confirmationResult });
       await recoverStopCacheFault(target, true);
       if (actualStreams.length > 0) {
+        retainedStoppedReply = c.messages.find(message => message.role === 'assistant' && message.turnId === stopping.runId && message.interrupted);
+        assert.ok(retainedStoppedReply?.text && retainedStoppedReply.providerItemId, 'The actual stopped text must become a stable transcript message before another request or reconnect');
         const stoppedReply = await until(() => ui(`(() => {
-          const draft=document.querySelector('#reply-draft'),label=draft.querySelector('.streaming-label').textContent;
-          return !draft.hidden && label==='· interrupted' && document.querySelector('#reply-state').textContent==='Ready'
-            ? {visible:true,label,header:document.querySelector('#reply-state').textContent}:false;
+          const row=[...document.querySelectorAll('[data-message-id]')].find(row=>row.dataset.messageId===${JSON.stringify(retainedStoppedReply.id)}),label=row?.querySelector('.interrupted-state')?.textContent;
+          return row && label==='Interrupted' && document.querySelector('#reply-draft').hidden && document.querySelector('#reply-state').textContent==='Ready'
+            ? {retained:true,label,header:document.querySelector('#reply-state').textContent}:false;
         })()`), 5000, 'The cancelled partial answer still claims it is replying');
         check('stopped-partial-label', 'Confirmed cancellation labels the visible partial answer as interrupted without requiring an error',
-          !c.state.busy && !c.state.stopping && c.state.error === null && stoppedReply.label === '· interrupted',
+          !c.state.busy && !c.state.stopping && c.state.error === null && stoppedReply.label === 'Interrupted',
           'real-ui-model', {runId:stopping.runId,...stoppedReply,error:c.state.error});
+        await bounded(c.saveQueue, 5000, 'The stopped reply did not finish its normal transcript save');
+        const saved = JSON.parse(await readFile(join(c.dataDir,'settings.json'),'utf8'));
+        check('stopped-partial-saved', 'The stopped text is saved before another request or reconnect can restore it',
+          saved.messages.some(message=>message.id===retainedStoppedReply.id && message.providerItemId===retainedStoppedReply.providerItemId && message.text===retainedStoppedReply.text && message.interrupted===true),
+          'real-filesystem-ui-model', {messageId:retainedStoppedReply.id,providerItemId:retainedStoppedReply.providerItemId,characters:retainedStoppedReply.text.length});
       }
       record.outcome = 'cancelled'; record.approvalResult = confirmationResult;
       Object.assign(stopping.entry, { status: stoppedRun.status, cancelled: true });
@@ -695,6 +702,12 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     const finalToken = marker + '-RECOVERED';
     const followup = await sendFromUI(`Text-only session verification. Do not use tools. Reply with exactly this token and nothing else: ${finalToken}`, 'recovery-send');
     await completed(followup, finalToken);
+    if (retainedStoppedReply) {
+      check('stopped-partial-survives-followup', 'A later real reply and reconnect retain the interrupted answer once with its original identity',
+        c.messages.filter(message=>message.id===retainedStoppedReply.id && message.providerItemId===retainedStoppedReply.providerItemId && message.text===retainedStoppedReply.text && message.interrupted===true).length===1 &&
+        await ui(`(()=>{const rows=[...document.querySelectorAll('[data-message-id]')].filter(row=>row.dataset.messageId===${JSON.stringify(retainedStoppedReply.id)});return rows.length===1 && rows[0].querySelector('.interrupted-state')?.textContent==='Interrupted';})()`),
+        'real-ui-model-after-reconnect', {messageId:retainedStoppedReply.id,providerItemId:retainedStoppedReply.providerItemId,characters:retainedStoppedReply.text.length});
+    }
     await snapshot('06-usable-recovered-session.png');
     await until(() => bounded(bubble.webContents.executeJavaScript(`window.hephaestusBubbleInspect().renderedText.includes(${JSON.stringify(finalToken)})`), 5000, 'The answer bubble did not answer'),
       5000, 'The real recovered answer did not reach the answer bubble');

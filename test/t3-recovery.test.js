@@ -209,6 +209,7 @@ test('a confirmed runtime event acknowledges delivery even when the dispatch rep
   let accepted = 0;
   c.t3 = { call: async (_tag, payload) => {
     event(c, { id: 'run', status: 'running', userMessageId: payload.messageId }, 'run.created');
+    event(c, { id: 'accepted-answer', runId: 'run', type: 'assistant_message', text: 'The acknowledged request completed.', streaming: false });
     event(c, { id: 'run', status: 'completed' }, 'run.updated');
     throw new Error('Dispatch reply lost');
   } };
@@ -397,7 +398,7 @@ test('a successful dispatch shares its image only when the request is acknowledg
 
 test('run.created acknowledgement shares an accepted image once even if its dispatch reply is lost',async()=>{
  const{c,shared}=await sharedFrameFixture();let accepted=0;
- c.t3={call:async(tag,p)=>{if(tag==='assets.persistChatAttachments')return{attachments:[{id:'asset'}]};event(c,{id:'run',userMessageId:p.messageId,status:'running'},'run.created');assert.equal(shared.length,1);event(c,{id:'run',status:'completed'},'run.updated');throw Error('Reply lost');}};
+ c.t3={call:async(tag,p)=>{if(tag==='assets.persistChatAttachments')return{attachments:[{id:'asset'}]};event(c,{id:'run',userMessageId:p.messageId,status:'running'},'run.created');assert.equal(shared.length,1);event(c,{id:'image-answer',runId:'run',type:'assistant_message',text:'The accepted image was received.',streaming:false});event(c,{id:'run',status:'completed'},'run.updated');throw Error('Reply lost');}};
  await c.turn('Read this image',{onAccepted:()=>accepted++});assert.equal(accepted,1);assert.equal(shared.length,1);assert.equal(c.state.error,null);
 });
 

@@ -15,6 +15,7 @@ function render(next) {
   if (!thinking || next.stopping) activeTools.clear();
   const activeTool = [...activeTools.values()].at(-1);
   mode.textContent = next.stopping ? 'Stopping…' : next.speaking ? 'Speaking' : next.sendPending ? 'Sending…' : activeTool ? 'Using ' + activeTool : thinking ? 'Thinking…' : next.running === false ? 'Paused' : 'Here with you';
+  if (!thinking && !next.sendPending && next.running !== false && next.replyIssue?.kind === 'empty') { mode.textContent = 'No text reply'; display('Open the conversation to review your message and check any completed actions.'); }
   mode.title = mode.textContent; dots.hidden = !thinking || !!next.stopping; wave.hidden = !next.speaking;
   document.body.classList.toggle('talking',next.speaking === true); document.body.classList.toggle('thinking',thinking);
 }
@@ -31,6 +32,6 @@ document.getElementById('bubble-dismiss').onclick = () => request('toggle-bubble
 document.addEventListener('keydown',event => { if (event.key === 'Escape') request('toggle-bubble').catch(() => {}); });
 let lastHeight = 0;
 new ResizeObserver(() => { const height = document.getElementById('answer-bubble').offsetHeight; if (height !== lastHeight) { lastHeight = height; request('bubble-size',{height}).catch(() => {}); } }).observe(document.getElementById('answer-bubble'));
-try { const initial = await request('init'); render(initial.state); const message = initial.messages.filter(item => item.role === 'assistant').at(-1); if (message) display(message.toolWarning ? 'Action failed: ' + message.toolWarning + '\n\n' + message.text : message.text); }
+try { const initial = await request('init'); render(initial.state); const message = initial.messages.filter(item => item.role === 'assistant' && item.text?.trim()).at(-1); if (message && initial.state.replyIssue?.kind !== 'empty') display(message.toolWarning ? 'Action failed: ' + message.toolWarning + '\n\n' + message.text : message.text); }
 catch { mode.textContent = 'Reconnecting'; display('Open the conversation window to check the connection.'); }
 window.hephaestusBubbleInspect = () => ({text:pending,renderedText:text.textContent,thinking:!dots.hidden,talking:!wave.hidden,hasInput:!!document.querySelector('input,textarea'),cardCount:document.querySelectorAll('#answer-bubble').length});

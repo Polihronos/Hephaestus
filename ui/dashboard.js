@@ -237,6 +237,7 @@ new ResizeObserver(() => { if (following) followConversation(); }).observe($('an
 $('jump-latest').onclick = () => followConversation(true);
 function message(value, {restored = false} = {}) {
   if (!value?.id) return;
+  if (value.role === 'assistant' && !String(value.text ?? '').trim()) return;
   const existing = messages.get(value.id), old = existing?.message;
   let row = existing?.row;
   if (!row) {
@@ -253,8 +254,10 @@ function message(value, {restored = false} = {}) {
   const label = document.createElement('small');
   label.textContent = (value.role === 'user' ? `YOU${value.source === 'wispr' ? ' · WISPR' : ''}` : value.role === 'system' ? 'SYSTEM' : value.source === 'noticed' ? 'HEPHAESTUS NOTICED' : 'HEPHAESTUS') + ' · ' + time(value.at);
   if (value.role === 'user' && ['failed','pending'].includes(value.delivery)) { const delivery = document.createElement('span'); delivery.className = 'delivery-state'; delivery.textContent = value.delivery === 'failed' ? 'Not sent' : 'Sending…'; label.append(delivery); }
+  if (value.interrupted) { const status = document.createElement('span'); status.className = 'delivery-state interrupted-state'; status.textContent = 'Interrupted'; label.append(status); }
+  if (value.role === 'user' && value.replyStatus === 'empty') { const status = document.createElement('span'); status.className = 'delivery-state empty-reply-state'; status.textContent = 'No text reply'; label.append(status); }
   const body = document.createElement('div'); renderMarkdown(body,(value.toolWarning ? 'Action failed: ' + value.toolWarning + '\n\n' : '') + value.text); row.append(label,body);
-  if (value.delivery === 'failed') { const actions = document.createElement('div'); actions.className = 'message-actions'; const retry = document.createElement('button'); retry.textContent = 'Review & retry'; retry.onclick = () => reviewMessage(value.text); actions.append(retry); row.append(actions); }
+  if (value.delivery === 'failed' || value.replyStatus === 'empty') { const actions = document.createElement('div'); actions.className = 'message-actions'; const retry = document.createElement('button'); retry.textContent = value.delivery === 'failed' ? 'Review & retry' : 'Review message'; retry.onclick = () => reviewMessage(value.text); actions.append(retry); row.append(actions); }
   if (value.source === 'noticed') {
     const actions = document.createElement('div'); actions.className = 'message-actions';
     for (const [feedback,text] of [['useful','Helpful'],['dismiss','Dismiss']]) { const button = document.createElement('button'); button.textContent = text; button.setAttribute('aria-pressed',String(value.noticeFeedback === feedback)); button.onclick = () => perform('notice-feedback',{id:value.id,value:feedback}); actions.append(button); }

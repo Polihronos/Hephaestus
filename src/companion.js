@@ -188,6 +188,7 @@ export class Companion extends EventEmitter{
   this.userRequests=(this.userRequests??0)+1;let accepted=false,message;
   const accept=()=>{if(accepted)return;accepted=true;if(message){message.delivery='sent';this.emit('messageUpdated',{...message});}onAccepted?.();};
   try{
+   if(this.state.replyIssue)this.publish({replyIssue:null});
    message=this.message('user',text,{source,delivery:'pending',...(fast?{localCommand:true}:{})});const interrupted=await this.interrupt(),token=this.generation;
    const current=()=>{if(request!==this.submitSequence||token!==this.generation||this.closed)throw new Error('Request interrupted');};current();
    if(fast?.kind==='stop'){this.message('assistant',interrupted?.confirmed===false?'Stopping the request.':'Stopped.',{source:'local'});accept();return;}

@@ -16,6 +16,10 @@ Hephaestus can selectively point out useful things with temporary highlights and
 
 The conversation can take the full dashboard width with **Hide screen**. Streaming replies stay in the conversation; reading older messages preserves your position and offers **Latest** to catch up. Messages stay in the composer until their dispatch is acknowledged, and a failed send remains available for review and retry. Reconnection restores active work and missing replies from the runtime. **Stop** reports whether cancellation is confirmed; local desktop actions are revoked immediately even if the runtime cannot confirm the stop.
 
+After confirmed Stop, the text already received stays in the conversation with an **Interrupted** label. It is saved immediately and remains available when you start another request.
+
+If a request finishes without a text reply, it is marked **No text reply**. **Review message** returns the original text to the composer. Check Activity for any completed actions before sending it again.
+
 If cancellation is not confirmed, **Retry Stop** retries the original request. After the reply has stopped, **Save Stop recovery** retries saving its recovery record for the next startup. Recovery-save retries do not cancel a newer request. A recovery-write error does not prevent Hephaestus from requesting cancellation while connected.
 
 Settings that enable speech or app control take effect after a successful save. Failed changes stay inactive. Turning off screen sharing, control or microphone input takes effect immediately; if that change cannot be saved, the app explains that it remains active for this session and offers a retry. Save it successfully before restarting to keep that preference.

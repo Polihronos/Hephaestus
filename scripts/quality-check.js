@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import {verifyInstructionSettings} from './settings-check.js';
 import {verifyOrdinarySettings} from './ordinary-settings-check.js';
+import {verifyReplyRecovery} from './reply-recovery-check.js';
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check, timeout = 15000, message = 'Condition was not met') {
@@ -140,6 +141,9 @@ export async function qualityCheck({ dashboard, mascot, bubble, companion: c, ro
       Object.assign(restoration,{boundsAfter:dashboard.getBounds(),minimumAfter:dashboard.getMinimumSize()});
       assert.deepEqual(report.warningLayout.restoration.boundsAfter,warningBefore.bounds,'Warning verification did not restore native window bounds');assert.deepEqual(report.warningLayout.restoration.minimumAfter,warningBefore.minimum,'Warning verification did not restore native minimum size');
     }
+    report.replyRecovery=await verifyReplyRecovery({root,companion:c,dashboard,bubble,app,showDashboard,out});
+    for(const name of report.replyRecovery.checks)check(name,true);
+    report.screenshots.push(...report.replyRecovery.screenshots);
     await showDashboard('companion');
     const messagesBeforeLong=c.messages.length,runsBeforeLong=c.t3Runs.size;
     await dashboard.webContents.executeJavaScript(String.raw`(()=>{const input=document.querySelector('#dashboard-input');input.value='  '+'Я'.repeat(16001)+'\n';input.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#message-form').requestSubmit();})()`);

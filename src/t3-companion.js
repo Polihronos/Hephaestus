@@ -11,6 +11,8 @@ import {ensureProjectTrust} from './project-trust.js';
 
 const cleanText=text=>(text??'').replace(/^<previous_conversation>[\s\S]*?<\/previous_conversation>\s*/,'').split(/<screen_observation>|<recent_companion_observations>|<companion_runtime>/)[0].trim();
 const terminal=new Set(['completed','failed','cancelled','interrupted','rolled_back']);
+const emptyReplyError='The request finished without a text reply. Check Activity for completed actions before trying again.';
+const knownText=(item,previous)=>item.type==='assistant_message'&&!item.text?.trim()&&previous?.text?.trim()?{...item,text:previous.text}:item;
 const timestamp=(...values)=>{for(const value of values){if(value==null)continue;const at=Date.parse(value);if(Number.isFinite(at))return at;}return null;};
 export class T3Companion extends Companion {
  async connect(){
@@ -112,12 +114,49 @@ export class T3Companion extends Companion {
   });
   this.t3StopPersistencePromise=pending;return pending;
  }
+ markEmptyReply(run){
+  if(!run?.id||run.id!==this.t3RunId||run.status!=='completed'||this.t3StopIntent||this.ignoredT3Runs?.has(run.id))return false;
+  if([...(this.t3Seen?.values()??[])].some(item=>item.runId===run.id&&item.type==='assistant_message'&&item.text?.trim())||this.messages.some(message=>message.role==='assistant'&&message.turnId===run.id&&message.text?.trim()))return false;
+  const request=this.messages.find(message=>message.role==='user'&&message.t3MessageId===(run.userMessageId??this.t3MessageId));
+  if(request&&request.replyStatus!=='empty'){
+   request.replyStatus='empty';this.emit('messageUpdated',{...request});
+   Promise.resolve(this.save()).catch(()=>this.publish({error:'The reply status could not be saved. Your message remains visible in the conversation.'}));
+  }
+  if(this.state.replyIssue?.runId!==run.id)this.publish({replyIssue:{kind:'empty',runId:run.id,requestId:request?.id},error:emptyReplyError});
+  return true;
+ }
+ clearEmptyReply(runId){
+  const run=this.t3Runs?.get(runId),request=this.messages.find(message=>message.role==='user'&&message.t3MessageId===(run?.userMessageId??(runId===this.t3RunId?this.t3MessageId:null)));
+  if(request?.replyStatus==='empty'){
+   delete request.replyStatus;this.emit('messageUpdated',{...request});
+   Promise.resolve(this.save()).catch(()=>this.publish({error:'The updated reply status could not be saved. Your reply remains visible in the conversation.'}));
+  }
+  if(this.state.replyIssue?.runId===runId)this.publish({replyIssue:null,...(this.state.error===emptyReplyError?{error:null}:{})});
+ }
+ retainStoppedReplies(run,items=[]){
+  if(!run?.id)return[];
+  const known=new Map(this.t3Seen??[]);for(const item of items)if(item.id)known.set(item.id,item);
+  const existing=new Set(this.messages.map(message=>message.providerItemId)),added=[];
+  for(const item of known.values()){
+   if(item.runId!==run.id||item.type!=='assistant_message'||!item.id||existing.has(item.id)||typeof item.text!=='string'||!item.text.trim())continue;
+   const message={id:randomUUID(),role:'assistant',text:item.text,providerItemId:item.id,turnId:run.id,
+    at:timestamp(item.completedAt,item.startedAt,item.createdAt,item.updatedAt)??Date.now(),interrupted:item.streaming===true||run.status!=='completed',toolWarning:this.lastActionError??null};
+   this.messages.push(message);added.push(message);existing.add(item.id);
+  }
+  if(added.length){
+   this.messages.sort((a,b)=>(a.at??0)-(b.at??0));this.messages=this.messages.slice(-120);
+   this.emit('messagesRestored',this.messages);
+   Promise.resolve(this.save()).catch(()=>this.publish({error:'The interrupted reply is still visible, but could not be saved. Copy it before closing Hephaestus.'}));
+  }
+  return added;
+ }
  reconcilePendingStop(projection){
   const intent=this.t3StopIntent;if(!intent)return false;
   const runs=projection.runs??[],run=intent.runId?runs.find(r=>r.id===intent.runId):runs.find(r=>r.userMessageId===intent.messageId);
   this.rememberStoppedRun(intent,run);
   const active=projection.thread?.activeRunId||runs.some(r=>!terminal.has(r.status));
   if(!(run&&terminal.has(run.status))&&!(intent.sent&&!intent.accepted&&!intent.runId&&!active))return false;
+  this.retainStoppedReplies(run,projection.turnItems??[]);
   this.t3StopIntent=null;this.t3Outstanding=null;this.desktopActionsRevoked=true;this.t3InFlight=false;this.externalT3Run=false;this.turnId=null;this.t3Finish?.();
   this.publish({busy:false,stopping:false,background:false,activity:this.state.connection==='connected'?'Ready':'Reconnecting to T3',error:null,stopRetryId:null});
   this.persistStopState();return true;
@@ -149,12 +188,12 @@ export class T3Companion extends Companion {
   if(this.t3StopIntent){this.rememberStoppedRun(this.t3StopIntent,run);this.desktopActionsRevoked=true;this.t3InFlight=true;this.publish({busy:true,stopping:true,activity:'Stopping'});return false;}
   if(this.ignoredT3Runs?.has(run.id))return false;
   const nativeTurn=this.turnId,nativeThread=this.activeThreadId;this.generation++;if(this.background&&nativeTurn){this.ignoredTurns??=new Set();this.ignoredTurns.add(nativeTurn);this.rpc.call('turn/interrupt',{threadId:nativeThread,turnId:nativeTurn}).catch(()=>{});this.finishTurn?.();this.finishTurn=null;}
-  this.t3InFlight=true;this.t3Outstanding={threadId:this.t3ThreadId,messageId:run.userMessageId,runId:run.id,accepted:true};this.externalT3Run=true;this.desktopActionsRevoked=false;this.background=false;this.turnId=null;this.t3RunId=run.id;this.t3TurnStart=Date.now();this.t3FirstText=false;this.t3MessageId=run.userMessageId;this.currentUserText=run.request??'';this.actionCount=0;this.lastActionError=null;this.emit('responseStart',{generation:this.generation});this.publish({busy:true,stopping:false,background:false,activity:run.status==='waiting'?'Waiting for your answer':'Thinking'});return true;
+  this.t3InFlight=true;this.t3Outstanding={threadId:this.t3ThreadId,messageId:run.userMessageId,runId:run.id,accepted:true};this.externalT3Run=true;this.desktopActionsRevoked=false;this.background=false;this.turnId=null;this.t3RunId=run.id;this.t3TurnStart=Date.now();this.t3FirstText=false;this.t3MessageId=run.userMessageId;this.currentUserText=run.request??'';this.actionCount=0;this.lastActionError=null;this.emit('responseStart',{generation:this.generation});this.publish({busy:true,stopping:false,background:false,replyIssue:null,activity:run.status==='waiting'?'Waiting for your answer':'Thinking'});return true;
  }
  restoreProjection(p){
   for(const run of p.runs??[])this.t3Runs.set(run.id,{...run,request:cleanText(p.messages?.find(m=>m.id===run.userMessageId)?.text)});
   for(const attempt of p.attempts??[])this.t3Attempts.set(attempt.id,attempt.runId);
-  for(const item of p.turnItems??[])this.t3Seen.set(item.id,item);
+  for(const item of p.turnItems??[])this.t3Seen.set(item.id,knownText(item,this.t3Seen.get(item.id)));
   const active=(p.runs??[]).find(r=>r.id===p.thread?.activeRunId)??[...(p.runs??[])].reverse().find(r=>!terminal.has(r.status));
   if(this.t3StopIntent){
    this.reconcilePendingStop(p);
@@ -170,8 +209,9 @@ export class T3Companion extends Companion {
    if(this.externalT3Run||this.desktopActionsRevoked){this.externalT3Run=false;this.t3InFlight=false;this.turnId=null;this.publish({busy:false,stopping:false,background:false,activity:this.state.connection==='connected'?'Ready':'Reconnecting to T3'});}
   }
   // Restore missing transcript items without replaying speech or opening old popups.
-  for(const item of p.turnItems??[]){
-   if(item.streaming||!['assistant_message','user_message'].includes(item.type))continue;
+  for(const remoteItem of p.turnItems??[]){
+   const item=this.t3Seen.get(remoteItem.id)??remoteItem;
+   if(item.streaming||!['assistant_message','user_message'].includes(item.type)||item.type==='assistant_message'&&!item.text?.trim())continue;
    const user=item.type==='user_message',remote=item.messageId?p.messages?.find(m=>m.id===item.messageId):null,run=this.t3Runs.get(item.runId);
    const at=user?timestamp(remote?.createdAt,item.startedAt,item.createdAt,item.completedAt,run?.requestedAt,item.updatedAt):timestamp(item.completedAt,item.startedAt,item.createdAt,item.updatedAt);
    const existing=this.messages.find(m=>m.providerItemId===item.id||(user&&item.messageId&&m.t3MessageId===item.messageId));
@@ -184,12 +224,13 @@ export class T3Companion extends Companion {
   }
   this.messages.sort((a,b)=>(a.at??0)-(b.at??0));this.messages=this.messages.slice(-120);
   this.emit('messagesRestored',this.messages);
+  this.markEmptyReply(this.t3Runs?.get(this.t3RunId));
   for(const provider of p.providerThreads??[])this.providerUpdate(provider);
   for(const turn of p.providerTurns??[])this.providerTurnUpdate(turn);
  }
  t3Stream(item){
   if(item.kind==='snapshot'){this.restoreProjection(item.projection);return;}if(item.kind!=='event')return;
-  const {type,payload:p}=item.event;if(p.runId&&this.ignoredT3Runs?.has(p.runId)&&!['run.created','run.updated'].includes(type))return;
+  const {type,payload}=item.event;let p=payload;if(p.runId&&this.ignoredT3Runs?.has(p.runId)&&!['run.created','run.updated'].includes(type))return;
   if(type==='provider-thread.updated')this.providerUpdate(p);
   if(type==='provider-turn.updated')this.providerTurnUpdate(p);
   if(type==='run-attempt.created'||type==='run-attempt.updated')this.t3Attempts.set(p.id,p.runId);
@@ -201,11 +242,13 @@ export class T3Companion extends Companion {
    const pending=this.t3PendingAcceptance;if(!this.t3StopIntent&&pending?.messageId===p.userMessageId&&pending.generation===this.generation)pending.acknowledge();
   }
   if(type==='run.updated'&&terminal.has(p.status)&&this.t3StopIntent)this.reconcilePendingStop({runs:[p]});
-  if(type==='run.updated'&&p.id===this.t3RunId){if(terminal.has(p.status)){this.t3Outstanding=null;if(p.status==='failed'&&!this.ignoredT3Runs?.has(p.id))this.publish({error:'T3 could not complete this request. See Activity for details.'});this.t3Finish?.();if(this.externalT3Run||this.desktopActionsRevoked){this.externalT3Run=false;this.t3InFlight=false;this.turnId=null;this.publish({busy:false,stopping:false,activity:this.state.connection==='connected'?'Ready':'Reconnecting to T3'});}}else this.publish({activity:this.state.stopping?'Stopping':p.status==='waiting'?'Waiting for your answer':'Thinking'});}
+  if(type==='run.updated'&&p.id===this.t3RunId){if(terminal.has(p.status)){this.t3Outstanding=null;this.markEmptyReply(p);if(p.status==='failed'&&!this.ignoredT3Runs?.has(p.id))this.publish({error:'T3 could not complete this request. See Activity for details.'});this.t3Finish?.();if(this.externalT3Run||this.desktopActionsRevoked){this.externalT3Run=false;this.t3InFlight=false;this.turnId=null;this.publish({busy:false,stopping:false,activity:this.state.connection==='connected'?'Ready':'Reconnecting to T3'});}}else this.publish({activity:this.state.stopping?'Stopping':p.status==='waiting'?'Waiting for your answer':'Thinking'});}
   if(type==='thread.model-selection-updated'){this.publish({model:p.modelSelection.model,effort:p.modelSelection.options?.find(o=>o.id==='reasoningEffort')?.value??'low'});this.save().catch(()=>{});}
   if(type!=='turn-item.updated')return;
-  const old=this.t3Seen.get(p.id);this.t3Seen.set(p.id,p);
+  const old=this.t3Seen.get(p.id),incomingText=p.text;p=knownText(p,old);this.t3Seen.set(p.id,p);
   if(p.type==='assistant_message'){
+   if(!p.text?.trim()||p.streaming&&!incomingText?.trim())return;
+   this.clearEmptyReply(p.runId);
    if(p.streaming){if(!this.t3FirstText){this.t3FirstText=true;this.publish({lastReplyMs:Date.now()-this.t3TurnStart});}this.emit('delta',{itemId:p.id,turnId:p.runId,generation:this.generation,full:p.text,text:p.text.slice(old?.text?.length??0)});}
    else if(!this.messages.some(m=>m.providerItemId===p.id)){
     if(!this.t3FirstText){this.t3FirstText=true;this.publish({lastReplyMs:Date.now()-this.t3TurnStart});}
@@ -276,7 +319,7 @@ export class T3Companion extends Companion {
   const timings={startedAt:this.t3TurnStart,captureMs:0,attachmentMs:0,dispatchMs:0};
   let accepted=false,sentObservation;const acknowledge=()=>{if(accepted||generation!==this.generation)return;accepted=true;if(this.t3Outstanding?.messageId===requestId)this.t3Outstanding.accepted=true;if(sentObservation)this.shareModelObservation(sentObservation,{generation});onAccepted?.({requestId});};
   this.t3PendingAcceptance={messageId:requestId,generation,acknowledge};
-  this.publish({busy:true,background:false,activity:'Thinking'});this.emit('responseStart',{generation});
+  this.publish({busy:true,background:false,replyIssue:null,activity:'Thinking'});this.emit('responseStart',{generation});
   let timer;const done=new Promise(resolve=>{this.t3Finish=resolve;timer=setTimeout(()=>{this.publish({error:'T3 is taking longer than expected. You can stop the request.'});},90000);});
   try{
    let attachments=[],screenText='';if(this.state.watching){
