@@ -4,6 +4,12 @@ $installRoot = Join-Path $env:LOCALAPPDATA 'ScreenCompanion'
 $resolvedInstall = [IO.Path]::GetFullPath($installRoot)
 $allowedRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'ScreenCompanion'))
 if($resolvedInstall -ne $allowedRoot){throw 'Unexpected installation target'}
+$installedExecutable=Join-Path $resolvedInstall 'ScreenCompanion.exe'
+$runningInstallation=Get-Process -Name ScreenCompanion -ErrorAction SilentlyContinue | Where-Object { -not $_.Path -or [IO.Path]::GetFullPath($_.Path) -eq $installedExecutable }
+if($runningInstallation){throw 'Quit Hephaestus before installing this update, then run install-local.ps1 again. No application files have been changed.'}
+$codexPath=(Get-Command codex -ErrorAction Stop).Source
+& node (Join-Path $PSScriptRoot 'check-codex.js') $codexPath
+if($LASTEXITCODE -ne 0){throw 'Codex launcher validation failed. No application files have been changed.'}
 New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
 Copy-Item -Path (Join-Path $projectRoot 'node_modules\electron\dist\*') -Destination $installRoot -Recurse -Force
 Move-Item -LiteralPath (Join-Path $installRoot 'electron.exe') -Destination (Join-Path $installRoot 'ScreenCompanion.exe') -Force
@@ -18,7 +24,6 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'native\bin\release') -Destinatio
 Copy-Item -LiteralPath (Join-Path $projectRoot 'package.json') -Destination $appRoot -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md') -Destination $appRoot -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $appRoot -Force
-$codexPath=(Get-Command codex -ErrorAction Stop).Source
 $runtimeJson=@{codexPath=$codexPath} | ConvertTo-Json
 [IO.File]::WriteAllText((Join-Path $appRoot 'runtime-config.json'),$runtimeJson,(New-Object Text.UTF8Encoding($false)))
 Add-Type -AssemblyName System.Drawing

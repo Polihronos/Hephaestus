@@ -69,7 +69,7 @@ Sleep or screen lock pauses the companion. Elevated windows can reject input. Re
 
 ## Local build and installation
 
-Prerequisites: Windows, Node.js, .NET 8 SDK/runtime, `uv`, and the signed-in subscription CLI. T3 must be installed and running. Wispr Flow is needed only for its dictation mode.
+Prerequisites: Windows, Node.js 22 or newer, the **.NET 8 SDK**, `uv`, and the signed-in [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) with trusted `PreToolUse` hook support (tested with 0.167.0). Native and official npm Codex installations are supported. T3 must be installed and running. Wispr Flow is needed only for its dictation mode.
 
 ```powershell
 codex login status
@@ -80,6 +80,8 @@ npm start
 ```
 
 Setup installs local transcription dependencies, verifies the public speech model and desktop runtime, and builds the native helper. `scripts/install-local.ps1` installs into `%LOCALAPPDATA%\ScreenCompanion` and creates **Hephaestus** shortcuts. The existing settings location remains `%APPDATA%\Screen Companion\settings.json` for compatibility.
+
+Quit Hephaestus before running the installer for an update. Its preflight rejects a running installation before copying files. Interrupted runtime or speech-model downloads are verified and retried; incomplete files are never promoted into the installation.
 
 `node scripts/launch.cjs --hephaestus-check` verifies the dashboard, supplied sprite, real microphone echo mode, audible playback rejection, actual speech, popup attachment and dismissal, and a real model-controlled click in a temporary verification window. `--t3-check` verifies Luna through the real T3 runtime, inherited and desktop tools, native typing, proactive notices, Markdown, usage records, and the embedded workspace. Reports and actual screenshots go under `artifacts/`.
 

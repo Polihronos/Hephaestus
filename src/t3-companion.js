@@ -3,15 +3,19 @@ import {T3Client} from './t3-client.js';
 import {startDesktopServer} from './desktop-server.js';
 import {mkdir,readFile,writeFile,rename,unlink} from 'node:fs/promises';
 import {join} from 'node:path';
-import {homedir} from 'node:os';
 import {randomUUID} from 'node:crypto';
 import {T3Workspace,t3Tools} from './t3-workspace.js';
+import {promptHash,writePromptTransaction,readPromptTransaction,clearPromptTransaction} from './prompt-recovery.js';
+import {ensureOriginHook} from './origin-hooks.js';
+import {ensureProjectTrust} from './project-trust.js';
 
 const cleanText=text=>(text??'').replace(/^<previous_conversation>[\s\S]*?<\/previous_conversation>\s*/,'').split(/<screen_observation>|<recent_companion_observations>|<companion_runtime>/)[0].trim();
 const terminal=new Set(['completed','failed','cancelled','interrupted','rolled_back']);
 const timestamp=(...values)=>{for(const value of values){if(value==null)continue;const at=Date.parse(value);if(Number.isFinite(at))return at;}return null;};
 export class T3Companion extends Companion {
  async connect(){
+  if(this.closed)return;
+  while(this.promptSaveBarrier)await this.promptSaveBarrier;
   if(this.closed)return;
   this.publish({connection:'connecting',activity:'Connecting Hephaestus to T3'});
   const previous=this.t3;this.t3=null;this.workspace?.close();this.stopT3Subscription?.();await previous?.close();
@@ -25,6 +29,8 @@ export class T3Companion extends Companion {
   this.models=provider.models.filter(m=>!m.isLegacy).map(m=>({id:m.slug,name:m.name,efforts:m.capabilities?.optionDescriptors?.find(o=>o.id==='reasoningEffort')?.options.map(o=>o.id)??['low']}));
   await this.prepareWorkspace();
   let saved={};try{saved=JSON.parse(await readFile(join(this.dataDir,'t3-runtime.json'),'utf8'));}catch{}
+  this.promptRecovery=await readPromptTransaction(this.dataDir,this.state.prompt);
+  if(this.promptRecovery?.selected==='new'&&saved.stopIntent?.threadId===this.promptRecovery.oldThread)delete saved.stopIntent;
   if(!this.t3StopIntent&&saved.stopIntent?.threadId){this.t3StopIntent={...saved.stopIntent};this.desktopActionsRevoked=true;this.ignoredT3Runs??=new Set();if(saved.stopIntent.runId)this.ignoredT3Runs.add(saved.stopIntent.runId);}
   this.desktopToolVersion=saved.adapterVersion??0;
   this.t3ProjectId=saved.projectId;
@@ -35,20 +41,28 @@ export class T3Companion extends Companion {
   const luna={instanceId:'codex',model:'gpt-6-luna',options:[{id:'reasoningEffort',value:'low'},{id:'serviceTier',value:'default'}]},existingOverrides=this.t3Config.settings.projectSettingsOverrides?.[this.t3ProjectId]??{};
   const budgetDefaults={defaultModelSelection:luna,textGenerationModelSelection:luna,sourceControlWriterModelSelection:luna,reviewGuideModelSelection:luna,responseStreamingMode:'paragraph'};
   if(Object.entries(budgetDefaults).some(([k,v])=>JSON.stringify(existingOverrides[k])!==JSON.stringify(v)))await t3.call('server.updateSettings',{patch:{projectSettingsOverrides:{[this.t3ProjectId]:{...existingOverrides,...budgetDefaults}}}});
-  this.t3ThreadId=this.t3StopIntent?.threadId??this.t3Outstanding?.threadId??saved.threadId;this.t3Seen=new Map();this.providerNativeIds=new Map();this.providerContexts=new Map();this.t3Runs=new Map();this.t3Attempts=new Map();
+  this.t3ThreadId=this.t3StopIntent?.threadId??this.t3Outstanding?.threadId??(this.promptRecovery?this.promptRecovery.threadId:saved.threadId);this.t3Seen=new Map();this.providerNativeIds=new Map();this.providerContexts=new Map();this.t3Runs=new Map();this.t3Attempts=new Map();this.t3ProviderTurns=new Map();
   if(this.t3ThreadId){
    let projection;try{projection=await t3.call('orchestration.getThreadProjection',{threadId:this.t3ThreadId});}catch(error){if(this.t3StopIntent||this.t3Outstanding)throw error;this.t3ThreadId=null;}
-   if(projection){this.restoreProjection(projection);this.hasT3History=projection.runs.length>0;if(this.desktopToolVersion!==5&&!this.t3InFlight)await this.reloadDesktopTools(projection);}
+   if(projection){this.restoreProjection(projection);this.hasT3History=projection.runs.length>0;if(this.desktopToolVersion!==6&&!this.t3InFlight)await this.reloadDesktopTools(projection);}
   }
-  if(!this.t3ThreadId){const r=await t3.call('orchestration.launchThread',{commandId:randomUUID(),projectId:this.t3ProjectId,title:'Hephaestus',modelSelection:this.modelSelection(),runtimeMode:'full-access',interactionMode:'default',workspaceStrategy:{type:'root'}});this.t3ThreadId=r.threadId;this.desktopToolVersion=5;}
+  if(!this.t3ThreadId){const r=await t3.call('orchestration.launchThread',{commandId:randomUUID(),projectId:this.t3ProjectId,title:'Hephaestus',modelSelection:this.modelSelection(),runtimeMode:'full-access',interactionMode:'default',workspaceStrategy:{type:'root'}});this.t3ThreadId=r.threadId;this.desktopToolVersion=6;}
   await this.saveT3();
   this.workspace=await new T3Workspace({client:t3,dataDir:this.dataDir,context:()=>this.runtimeContext(),onActivity:e=>this.activityEvent(e)}).start();
-  this.stopT3Subscription?.();this.stopT3Subscription=t3.subscribe('orchestration.subscribeThread',{threadId:this.t3ThreadId},item=>this.t3Stream(item));
+  this.stopT3Subscription?.();this.stopT3Subscription=await t3.subscribeReady('orchestration.subscribeThread',{threadId:this.t3ThreadId},item=>this.t3Stream(item),{onError:error=>this.t3SubscriptionFailed(t3,error)});
   if(this.t3StopIntent)await this.replayPendingStop(t3);
   if(this.closed)return;if(!this.t3TransportReady||this.t3!==t3)throw new Error('T3 disconnected before startup completed');
+  this.promptRecoveryBlocked=false;
   this.publish({connection:'connected',runtime:'t3',t3ThreadId:this.t3ThreadId,t3Origin:t3.origin,models:this.models,activity:this.t3StopIntent?'Stopping':this.t3InFlight?'Continuing your request':'Ready',stopping:!!this.t3StopIntent,busy:!!this.t3StopIntent||!!this.t3InFlight,error:null});
   await this.updateUsage();
   await this.save();
+  if(this.promptRecovery)await this.finishPromptRecovery();
+ }
+ t3SubscriptionFailed(client,error){if(this.closed||this.t3!==client)return;this.t3Disconnected(client);this.publish({error:'The conversation stream disconnected. Reconnecting automatically.'});}
+ async finishPromptRecovery(){
+  const recovery=this.promptRecovery;if(!recovery)return;
+  for(const threadId of new Set([recovery.oldThread,recovery.newThread]))if(threadId!==this.t3ThreadId)await this.t3.call('orchestration.dispatchCommand',{type:'thread.archive',commandId:randomUUID(),threadId}).catch(error=>this.activityEvent({id:randomUUID(),kind:'tool',title:'Instruction recovery',status:'failed',text:error.message}));
+  await clearPromptTransaction(this.dataDir);this.promptRecovery=null;
  }
  modelSelection(){return{instanceId:'codex',model:this.state.model,options:[{id:'reasoningEffort',value:this.state.effort??'low'},{id:'serviceTier',value:'default'}]};}
  runtimeContext(){return{name:'Hephaestus',runtime:'T3 Code through Codex',model:this.state.model,projectId:this.t3ProjectId,threadId:this.t3ThreadId,t3Connected:!!this.t3?.token,desktopConnected:!!this.bridge,appControl:this.state.control,watching:this.state.watching,proactive:this.state.proactive,desktopTools:dynamicTools.map(t=>t.name),workspaceTool:'t3_workspace',promptFile:join(this.dataDir,'context','AGENTS.md')};}
@@ -56,10 +70,11 @@ export class T3Companion extends Companion {
  async prepareWorkspace(){
   const cwd=join(this.dataDir,'context');await mkdir(join(cwd,'.codex'),{recursive:true});await writeFile(join(cwd,'AGENTS.md'),this.state.prompt+'\n');
   const bridge=join(this.root,'src','desktop-mcp.js');await writeFile(join(cwd,'.codex','config.toml'),`[mcp_servers.hephaestus]\ncommand = "node"\nargs = [${JSON.stringify(bridge.replaceAll('\\','/'))}, ${JSON.stringify(join(this.dataDir,'desktop-bridge.json').replaceAll('\\','/'))}]\nstartup_timeout_sec = 10\ntool_timeout_sec = 60\n`);
-  const config=join(homedir(),'.codex','config.toml');let text=await readFile(config,'utf8');const key=JSON.stringify(cwd.replaceAll('\\','/'));if(!text.includes(`[projects.${key}]`)){text+=`\n[projects.${key}]\ntrust_level = "trusted"\n`;await writeFile(config,text);}
+  await ensureProjectTrust({rpc:this.rpc,contextDir:cwd});
+  this.originHook=await ensureOriginHook({rpc:this.rpc,contextDir:cwd,hookPath:join(this.root,'src','tool-origin-hook.js'),bridgeConfigPath:join(this.dataDir,'desktop-bridge.json')});
  }
  async saveT3(){
-  const data=JSON.stringify({version:1,adapterVersion:this.desktopToolVersion??5,projectId:this.t3ProjectId,threadId:this.t3ThreadId,...(this.t3StopIntent?{stopIntent:this.t3StopIntent}:{})},null,2);
+  const data=JSON.stringify({version:1,adapterVersion:this.desktopToolVersion??6,projectId:this.t3ProjectId,threadId:this.t3ThreadId,...(this.t3StopIntent?{stopIntent:this.t3StopIntent}:{})},null,2);
   this.t3SaveQueue=(this.t3SaveQueue??Promise.resolve()).catch(()=>{}).then(async()=>{const file=join(this.dataDir,'t3-runtime.json');await writeFile(file+'.tmp',data);await rename(file+'.tmp',file);});
   return this.t3SaveQueue;
  }
@@ -67,7 +82,7 @@ export class T3Companion extends Companion {
   const p=projection??await this.t3.call('orchestration.getThreadProjection',{threadId:this.t3ThreadId});
   if(p.thread?.activeRunId||(p.runs??[]).some(r=>!terminal.has(r.status)))throw new Error('The conversation is still working. Tool updates will apply after it finishes.');
   for(const session of p.providerSessions??[])if(session.status!=='stopped')await this.t3.call('orchestration.dispatchCommand',{type:'provider-session.detach',commandId:randomUUID(),threadId:this.t3ThreadId,providerSessionId:session.id,reason:'Reload Hephaestus desktop tools'});
-  this.desktopToolVersion=5;await this.saveT3();
+  this.desktopToolVersion=6;await this.saveT3();
  }
  t3Disconnected(client=this.t3){
   if(this.closed||this.t3!==client||this.t3TransportReady===false&&this.state.connection==='reconnecting')return;
@@ -187,13 +202,60 @@ export class T3Companion extends Companion {
   else if(!['user_message','checkpoint'].includes(p.type)&&!p.toolName?.startsWith('hephaestus.'))this.activityEvent({id:p.id,kind:'tool',title:p.toolName??p.title??p.type.replaceAll('_',' '),text:typeof p.input==='string'?p.input:JSON.stringify(p.input??p.error??p.reason??'').slice(0,3000),status:p.status==='running'||p.status==='pending'?'running':p.status==='failed'?'failed':'completed',durationMs:p.completedAt&&p.startedAt?Date.parse(p.completedAt)-Date.parse(p.startedAt):undefined});
  }
  providerUpdate(p){if(p.contextUsage?.usedTokens)this.providerContexts.set(p.id,p.contextUsage.usedTokens);const native=p.nativeThreadRef?.nativeId;if(native)this.providerNativeIds.set(p.id,native);const u=p.contextUsage;if(native&&u?.inputTokens!==undefined){this.ledger?.record(native,{...u,totalTokens:u.totalProcessedTokens??u.inputTokens+(u.outputTokens??0)},{model:this.state.model,purpose:'conversation',prompt:this.currentUserText??'',tools:this.activities.filter(a=>a.at>=this.t3TurnStart&&a.kind==='tool').map(a=>a.title)});this.publish({tokens:this.ledger.summary()});}}
- providerTurnUpdate(p){const native=this.providerNativeIds.get(p.providerThreadId),u=p.turnTokenUsage;if(!native||!u?.inputTokens)return;const run=this.t3Runs.get(this.t3Attempts.get(p.runAttemptId));this.ledger.recordTurn(native,p.id,{inputTokens:u.inputTokens,cachedInputTokens:u.cachedInputTokens,cacheCreationTokens:u.cacheCreationTokens,outputTokens:u.outputTokens,reasoningOutputTokens:u.reasoningTokens,totalTokens:u.inputTokens+u.outputTokens},{at:p.completedAt??p.startedAt,ordinal:p.ordinal,contextTokens:this.providerContexts.get(p.providerThreadId)??0,model:u.models?.[0]??run?.modelSelection?.model??this.state.model,purpose:this.dataDir.includes('verification')?'verification':'conversation',request:run?.request??this.currentUserText??'',tools:[...new Set([...this.t3Seen.values()].filter(i=>i.providerTurnId===p.id&&!['user_message','assistant_message','reasoning','checkpoint'].includes(i.type)).map(i=>i.toolName??i.title??i.type))],source:'live',serviceTier:'default'});this.publish({tokens:this.ledger.summary()});}
+ indexToolOriginProjection(projection,{threadId=this.t3ThreadId}={}){
+  if(projection.thread?.id&&projection.thread.id!==threadId)throw new Error('The tool origin projection belongs to another conversation');
+  this.providerNativeIds??=new Map();this.t3ProviderTurns??=new Map();this.t3Attempts??=new Map();this.t3Runs??=new Map();
+  for(const provider of projection.providerThreads??[])if(provider.id&&provider.nativeThreadRef?.nativeId)this.providerNativeIds.set(provider.id,provider.nativeThreadRef.nativeId);
+  for(const turn of projection.providerTurns??[])if(turn.id)this.t3ProviderTurns.set(turn.id,{...this.t3ProviderTurns.get(turn.id),...turn});
+  for(const attempt of projection.attempts??[])if(attempt.id&&attempt.runId)this.t3Attempts.set(attempt.id,attempt.runId);
+  for(const run of projection.runs??[])if(run.id)this.t3Runs.set(run.id,{...this.t3Runs.get(run.id),...run});
+ }
+ assertToolOriginContext(context){
+  if(this.closed||!this.t3||this.t3TransportReady===false||this.t3.socket&&this.t3.socket.readyState!==1||!this.t3InFlight||this.background||this.state.connection!=='connected'||!this.state.running||!this.state.busy||this.desktopActionsRevoked||this.t3StopIntent||this.state.stopping||this.state.instructionsSaving||this.updatingPrompt||this.promptRecoveryBlocked)throw new Error('No active Hephaestus request');
+  if(!this.t3ThreadId||!this.t3MessageId)throw new Error('The tool has no current conversation identity');
+  if(context&&(context.generation!==this.generation||context.threadId!==this.t3ThreadId||context.messageId!==this.t3MessageId||context.client!==this.t3))throw new Error('The originating tool request is no longer active');
+ }
+ toolOriginJoin(origin){
+  const matches=[];
+  for(const turn of this.t3ProviderTurns?.values()??[]){
+   if(turn.nativeTurnRef?.nativeId!==origin.nativeTurnId||this.providerNativeIds?.get(turn.providerThreadId)!==origin.nativeSessionId)continue;
+   const runId=this.t3Attempts?.get(turn.runAttemptId),run=this.t3Runs?.get(runId);
+   matches.push({turn,runId,run,complete:!!runId&&!!run&&typeof run.userMessageId==='string'&&typeof run.status==='string'});
+  }
+  return matches.length===1?matches[0]:{complete:false,ambiguous:matches.length>1};
+ }
+ assertToolOriginJoin(join){
+  if(!join.complete||join.ambiguous)throw new Error('The desktop tool origin could not be joined to a runtime request');
+  const{turn,runId,run}=join;
+  if(run.userMessageId!==this.t3MessageId||this.t3RunId&&runId!==this.t3RunId||run.threadId&&run.threadId!==this.t3ThreadId||turn.threadId&&turn.threadId!==this.t3ThreadId||this.ignoredT3Runs?.has(runId)||!['preparing','queued','starting','running','waiting'].includes(run.status)||terminal.has(turn.status))throw new Error('The desktop tool origin does not belong to the active request');
+ }
+ async authorizeToolOrigin(origin){
+  this.assertToolOriginContext();
+  if(!origin||!Object.isFrozen(origin)||!['nativeSessionId','nativeTurnId','toolUseId','nonce','tool'].every(key=>typeof origin[key]==='string'&&origin[key].length>0))throw new Error('A verified originating turn is required for desktop tools');
+  const context={generation:this.generation,threadId:this.t3ThreadId,messageId:this.t3MessageId,client:this.t3};let join=this.toolOriginJoin(origin);
+  if(!join.complete){
+   const projection=await context.client.call('orchestration.getThreadProjection',{threadId:context.threadId});
+   this.assertToolOriginContext(context);this.indexToolOriginProjection(projection,{threadId:context.threadId});join=this.toolOriginJoin(origin);
+  }
+  this.assertToolOriginContext(context);this.assertToolOriginJoin(join);
+  const lease=Object.freeze({generation:context.generation,threadId:context.threadId,messageId:context.messageId,runId:join.runId,providerTurnId:join.turn.id,providerThreadId:join.turn.providerThreadId,attemptId:join.turn.runAttemptId,nativeSessionId:origin.nativeSessionId,nativeTurnId:origin.nativeTurnId,toolUseId:origin.toolUseId,nonce:origin.nonce,tool:origin.tool});
+  this.toolOriginLeases??=new WeakSet();this.toolOriginLeaseContexts??=new WeakMap();this.toolOriginLeases.add(lease);this.toolOriginLeaseContexts.set(lease,context);return lease;
+ }
+ assertToolLease(lease){
+  this.assertToolOriginContext();
+  if(!lease||!this.toolOriginLeases?.has(lease))throw new Error('A verified desktop tool origin lease is required');
+  const context=this.toolOriginLeaseContexts.get(lease);if(!context)throw new Error('The desktop tool origin lease is invalid');this.assertToolOriginContext(context);const join=this.toolOriginJoin(lease);this.assertToolOriginJoin(join);
+  if(join.runId!==lease.runId||join.turn.id!==lease.providerTurnId||join.turn.providerThreadId!==lease.providerThreadId||join.turn.runAttemptId!==lease.attemptId)throw new Error('The originating runtime turn changed before the tool completed');
+  return lease;
+ }
+ providerTurnUpdate(p){this.t3ProviderTurns??=new Map();this.t3ProviderTurns.set(p.id,{...this.t3ProviderTurns.get(p.id),...p});const native=this.providerNativeIds?.get(p.providerThreadId),u=p.turnTokenUsage;if(!native||!u?.inputTokens)return;const run=this.t3Runs.get(this.t3Attempts.get(p.runAttemptId));this.ledger.recordTurn(native,p.id,{inputTokens:u.inputTokens,cachedInputTokens:u.cachedInputTokens,cacheCreationTokens:u.cacheCreationTokens,outputTokens:u.outputTokens,reasoningOutputTokens:u.reasoningTokens,totalTokens:u.inputTokens+u.outputTokens},{at:p.completedAt??p.startedAt,ordinal:p.ordinal,contextTokens:this.providerContexts.get(p.providerThreadId)??0,model:u.models?.[0]??run?.modelSelection?.model??this.state.model,purpose:this.dataDir.includes('verification')?'verification':'conversation',request:run?.request??this.currentUserText??'',tools:[...new Set([...this.t3Seen.values()].filter(i=>i.providerTurnId===p.id&&!['user_message','assistant_message','reasoning','checkpoint'].includes(i.type)).map(i=>i.toolName??i.title??i.type))],source:'live',serviceTier:'default'});this.publish({tokens:this.ledger.summary()});}
  async turn(text,{background=false,onAccepted}={}){
+  if(this.state.instructionsSaving||this.promptRecoveryBlocked)throw new Error('Instructions are still being saved or recovered. Your message has not been sent.');
   if(background)return super.turn(text,{background:true});
   if([this.state.usage?.primary,this.state.usage?.secondary].some(w=>w?.usedPercent>=100)){this.publish({backgroundVision:false});throw new Error('Your included Codex allowance is used up. Wait for its reset.');}
   if(!this.t3||this.state.connection!=='connected')throw new Error('T3 is reconnecting. Please try again shortly.');
   if(this.t3StopIntent||this.state.stopping||this.desktopActionsRevoked&&this.t3InFlight)throw new Error('The previous request has not stopped yet. Your message has not been sent.');
-  if(this.desktopToolVersion!==undefined&&this.desktopToolVersion!==5)await this.reloadDesktopTools();
+  if(this.desktopToolVersion!==undefined&&this.desktopToolVersion!==6)await this.reloadDesktopTools();
   const generation=++this.generation;this.background=false;this.desktopActionsRevoked=false;this.actionCount=0;this.lastActionError=null;this.t3TurnStart=Date.now();this.t3FirstText=false;this.observations.clear();this.currentUserText=text;this.t3MessageId=randomUUID();this.t3RunId=null;this.t3InFlight=true;this.externalT3Run=false;const requestId=this.t3MessageId;const localMessage=this.messages.filter(m=>m.role==='user').at(-1);if(localMessage)localMessage.t3MessageId=this.t3MessageId;
   const timings={startedAt:this.t3TurnStart,captureMs:0,attachmentMs:0,dispatchMs:0};
   let accepted=false,sentObservation;const acknowledge=()=>{if(accepted||generation!==this.generation)return;accepted=true;if(this.t3Outstanding?.messageId===requestId)this.t3Outstanding.accepted=true;if(sentObservation)this.shareModelObservation(sentObservation,{generation});onAccepted?.({requestId});};
@@ -220,16 +282,17 @@ export class T3Companion extends Companion {
   }catch(e){if(accepted){await done;}else{this.publish({error:e.message});throw e;}}
   finally{clearTimeout(timer);if(this.t3PendingAcceptance?.messageId===requestId)this.t3PendingAcceptance=null;if(this.t3MessageId===requestId){const recovering=this.state.connection!=='connected'||!!this.t3StopIntent;this.t3InFlight=recovering&&!!this.t3Outstanding;if(!recovering)this.t3Outstanding=null;this.t3Finish=null;this.turnId=null;this.activeThreadId=this.threadId;if(generation===this.generation)this.publish({busy:recovering?this.state.busy:false,activity:recovering?this.state.activity:'Ready',lastTotalMs:Date.now()-this.t3TurnStart,lastTimings:{...timings,firstTextMs:this.t3FirstText?this.state.lastReplyMs:null,totalMs:Date.now()-this.t3TurnStart}});}await this.ledger?.flush();}
  }
- async invokeDesktopTool(tool,args){
+ async invokeDesktopTool(tool,args,{lease,onDelivered}={}){
   if(![...dynamicTools,...t3Tools].some(t=>t.name===tool))throw new Error('Unknown Hephaestus tool');
-  if(!this.t3InFlight||this.state.connection!=='connected'||!this.state.running||!this.state.busy||this.desktopActionsRevoked||this.t3StopIntent)throw new Error('No active Hephaestus request');
+  if(!this.t3InFlight||this.state.connection!=='connected'||!this.state.running||!this.state.busy||this.desktopActionsRevoked||this.t3StopIntent||this.state.instructionsSaving||this.promptRecoveryBlocked)throw new Error('No active Hephaestus request');
+  this.assertToolLease(lease);if(lease.tool!==tool)throw new Error('The desktop tool lease belongs to another tool');if(onDelivered!==undefined&&typeof onDelivered!=='function')throw new Error('Invalid tool delivery callback');
   if(tool==='t3_workspace'){
-   const id=randomUUID(),started=Date.now(),generation=this.generation;this.activityEvent({id,kind:'tool',title:tool,status:'running',text:JSON.stringify(args)});
-   try{const result=await this.workspace.execute(args,()=>{if(generation!==this.generation||!this.t3InFlight||!this.state.running)throw new Error('This turn is no longer active');});this.activityEvent({id,kind:'tool',title:tool,status:'completed',text:JSON.stringify(result).slice(0,2500),durationMs:Date.now()-started});return{success:true,contentItems:[{type:'inputText',text:JSON.stringify(result)}]};}
-   catch(e){this.activityEvent({id,kind:'tool',title:tool,status:'failed',text:e.message});return{success:false,contentItems:[{type:'inputText',text:e.message}]};}
+   const id=randomUUID(),started=Date.now();this.activityEvent({id,kind:'tool',title:tool,status:'running',text:JSON.stringify(args)});
+   try{const result=await this.workspace.execute(args,()=>this.assertToolLease(lease));this.assertToolLease(lease);this.activityEvent({id,kind:'tool',title:tool,status:'completed',text:JSON.stringify(result).slice(0,2500),durationMs:Date.now()-started});return{success:true,contentItems:[{type:'inputText',text:JSON.stringify(result)}]};}
+   catch(e){this.activityEvent({id,kind:'tool',title:tool,status:'failed',text:e.message});this.assertToolLease(lease);return{success:false,contentItems:[{type:'inputText',text:e.message}]};}
   }
-  const turnId=this.turnId='t3-'+this.t3RunId,threadId=this.activeThreadId=this.t3ThreadId;
-  return new Promise(resolve=>super.onTool({method:'item/tool/call',id:randomUUID(),params:{threadId,turnId,tool,arguments:args}},{reply:(_id,result)=>resolve(result)}));
+  const turnId=this.turnId='t3-'+lease.runId,threadId=this.activeThreadId=lease.threadId;
+  return new Promise((resolve,reject)=>{const rpc={assertActive:()=>this.assertToolLease(lease),reply:(_id,result)=>{try{this.assertToolLease(lease);resolve(result);}catch(error){reject(error);}},deferSharedFrame:commit=>{const guarded=()=>{try{this.assertToolLease(lease);}catch{return false;}return commit();};if(onDelivered)onDelivered(guarded);else guarded();}};super.onTool({method:'item/tool/call',id:randomUUID(),params:{threadId,turnId,callId:lease.toolUseId,tool,arguments:args}},rpc).catch(reject);});
  }
  async interrupt(){
   if(this.t3InFlight||this.t3Outstanding||this.t3StopIntent){
@@ -242,33 +305,45 @@ export class T3Companion extends Companion {
   }
   return super.interrupt();
  }
- async replacePrompt(prompt){
+ async replacePrompt(prompt,{persist=()=>this.save({settings:{...this.state,prompt}})}={}){
   if(this.updatingPrompt)throw new Error('Instructions are already being saved.');
   this.updatingPrompt=true;
   try{
    const stopped=await this.interrupt();
    if(stopped?.confirmed===false||this.state.stopping||this.t3InFlight)throw new Error('Your current request is still stopping. Wait for it to finish, then save your instructions again.');
    if(!this.t3)throw new Error('The connection is recovering. Your instructions have not been changed.');
-   const path=join(this.dataDir,'context','AGENTS.md'),oldThread=this.t3ThreadId,oldHistory=this.hasT3History;
+   const client=this.t3,path=join(this.dataDir,'context','AGENTS.md'),oldThread=this.t3ThreadId;
    let previous;try{previous=await readFile(path,'utf8');}catch(e){if(e.code!=='ENOENT')throw e;}
    const created=await this.t3.call('orchestration.launchThread',{commandId:randomUUID(),projectId:this.t3ProjectId,title:'Hephaestus',modelSelection:this.modelSelection(),runtimeMode:'full-access',interactionMode:'default',workspaceStrategy:{type:'root'}});
-   let switched=false,promptWritten=false;
+   const buffered=[];let newSubscription,promptWritten=false,journalWritten=false,subscriptionError;
    try{
+    newSubscription=await client.subscribeReady('orchestration.subscribeThread',{threadId:created.threadId},item=>{if(this.t3ThreadId===created.threadId)this.t3Stream(item);else{if(item.kind==='snapshot'&&!Array.isArray(item.projection?.runs))throw new Error('The new conversation snapshot is invalid');buffered.push(item);}},{onError:error=>{subscriptionError=error;if(this.t3ThreadId===created.threadId)this.t3SubscriptionFailed(client,error);}});
+    await writePromptTransaction(this.dataDir,{oldThread,newThread:created.threadId,oldPromptHash:promptHash(this.state.prompt),newPromptHash:promptHash(prompt)});journalWritten=true;
     await writeFile(path+'.tmp',prompt+'\n');await rename(path+'.tmp',path);promptWritten=true;
-    this.stopT3Subscription?.();this.t3ThreadId=created.threadId;this.hasT3History=false;switched=true;
-    this.stopT3Subscription=this.t3.subscribe('orchestration.subscribeThread',{threadId:this.t3ThreadId},item=>this.t3Stream(item));
-    await this.saveT3();
+    if(subscriptionError)throw subscriptionError;if(this.t3!==client||this.state.connection!=='connected')throw new Error('The connection is recovering. Your instructions have not been changed.');
+    if(this.t3InFlight||this.t3StopIntent)throw new Error('Another request started while instructions were being prepared. Wait for it to finish and save again.');
+    await persist();
    }catch(error){
-    if(switched){this.stopT3Subscription?.();this.t3ThreadId=oldThread;this.hasT3History=oldHistory;this.stopT3Subscription=this.t3.subscribe('orchestration.subscribeThread',{threadId:oldThread},item=>this.t3Stream(item));}
-    if(promptWritten){if(previous!==undefined){await writeFile(path+'.tmp',previous);await rename(path+'.tmp',path);}else await unlink(path).catch(e=>{if(e.code!=='ENOENT')throw e;});}
+    newSubscription?.();
+    let restored=!promptWritten;
+    if(promptWritten)try{if(previous!==undefined){await writeFile(path+'.tmp',previous);await rename(path+'.tmp',path);}else await unlink(path).catch(e=>{if(e.code!=='ENOENT')throw e;});restored=true;}catch(rollbackError){this.promptRecoveryBlocked=true;this.publish({error:'Instructions could not be restored. Reconnect after fixing the settings folder before sending another request.'});}
     await unlink(path+'.tmp').catch(()=>{});
-    await this.t3.call('orchestration.dispatchCommand',{type:'thread.archive',commandId:randomUUID(),threadId:created.threadId}).catch(()=>{});
+    if(journalWritten&&restored)await clearPromptTransaction(this.dataDir).catch(()=>{});
+    await client.call('orchestration.dispatchCommand',{type:'thread.archive',commandId:randomUUID(),threadId:created.threadId}).catch(()=>{});
     throw error;
    }
-   this.publish({t3ThreadId:this.t3ThreadId,busy:false,stopping:false,activity:'Ready'});
-   await this.t3.call('orchestration.dispatchCommand',{type:'thread.archive',commandId:randomUUID(),threadId:oldThread}).catch(error=>{
+   // The atomic settings write is the commit point. Recovery metadata may be
+   // retried from the journal; it must not undo or misreport a committed save.
+   const oldSubscription=this.stopT3Subscription;this.t3ThreadId=created.threadId;this.hasT3History=false;this.state.prompt=prompt;this.stopT3Subscription=newSubscription;
+   try{oldSubscription?.();}catch{}
+   for(const item of buffered)try{this.t3Stream(item);}catch(error){subscriptionError=error;}
+   if(subscriptionError)this.t3SubscriptionFailed(client,subscriptionError);
+   let metadataSaved=false;try{await this.saveT3();metadataSaved=true;}catch(error){this.activityEvent({id:randomUUID(),kind:'tool',title:'Instruction recovery',status:'failed',text:'Instructions were saved; conversation recovery metadata will be retried from its journal.'});}
+   this.publish({t3ThreadId:this.t3ThreadId,busy:false,stopping:false,activity:this.state.connection==='connected'?'Ready':'Reconnecting to T3'});
+   await client.call('orchestration.dispatchCommand',{type:'thread.archive',commandId:randomUUID(),threadId:oldThread}).catch(error=>{
     this.activityEvent({id:randomUUID(),kind:'tool',title:'Conversation history',status:'failed',text:'Instructions were saved. The previous conversation could not be archived: '+error.message});
    });
+   if(metadataSaved)await clearPromptTransaction(this.dataDir).catch(error=>this.activityEvent({id:randomUUID(),kind:'tool',title:'Instruction recovery',status:'failed',text:error.message}));
   }finally{this.updatingPrompt=false;}
  }
  async close(){

@@ -3,6 +3,8 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { randomUUID } from 'node:crypto';
+import {verifyInstructionSettings} from './settings-check.js';
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check, timeout = 15000, message = 'Condition was not met') {
@@ -36,7 +38,9 @@ export async function qualityCheck({ dashboard, mascot, bubble, companion: c, ro
     report.screenshots.push(name);
   };
   try {
+    report.startup = { connection: c.state.connection, activity: c.state.activity, error: c.state.error ?? null };
     check('Real T3 conversation and subscription are connected', c.state.connection === 'connected' && c.state.runtime === 't3');
+    check('Desktop tools use the enabled trusted origin hook',c.originHook?.enabled===true&&c.originHook?.trustStatus==='trusted');
     await c.configure({ watching: false, backgroundVision: false, inputMode: 'wispr', spokenReplies: false });
     const version = app.getVersion();
     report.runtime = { version, model: c.state.model, platform: process.platform, electron: process.versions.electron };
@@ -83,10 +87,13 @@ export async function qualityCheck({ dashboard, mascot, bubble, companion: c, ro
     await dashboard.webContents.executeJavaScript(`(()=>{const e=document.querySelector('#excluded-apps');e.value='invalid/path.exe';e.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#save-privacy').click();})()`);
     await until(()=>dashboard.webContents.executeJavaScript(`document.querySelector('#excluded-apps').getAttribute('aria-invalid')==='true'`),3000,'Invalid privacy input did not surface an inline error');
     check('Settings failures preserve input and show plain guidance beside the field',await dashboard.webContents.executeJavaScript(`(()=>{const field=document.querySelector('#excluded-apps'),error=document.querySelector('#privacy-status'),r=error.getBoundingClientRect();return field.value==='invalid/path.exe'&&field.getAttribute('aria-describedby').includes('privacy-status')&&error.textContent.includes('process names')&&!error.textContent.includes('remote method')&&r.top>=0&&r.bottom<=innerHeight;})()`));
-    await snapshot('settings-error.png');
+    await snapshot('privacy-error.png');
     await dashboard.webContents.executeJavaScript(`(()=>{const field=document.querySelector('#excluded-apps');field.value='';field.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#save-privacy').click();})()`);
     await until(()=>dashboard.webContents.executeJavaScript(`document.querySelector('#privacy-status').textContent==='Private apps saved.'`),3000,'Corrected privacy settings were not saved');
     check('Correcting the field clears its error',await dashboard.webContents.executeJavaScript(`!document.querySelector('#excluded-apps').hasAttribute('aria-invalid')`));
+    report.instructions=await verifyInstructionSettings({root,companion:c,dashboard,showDashboard,out});
+    for(const name of report.instructions.checks)check(name,true);
+    report.screenshots.push(...report.instructions.screenshots);
     await showDashboard('companion');
     const messagesBeforeLong=c.messages.length,runsBeforeLong=c.t3Runs.size;
     await dashboard.webContents.executeJavaScript(String.raw`(()=>{const input=document.querySelector('#dashboard-input');input.value='  '+'Я'.repeat(16001)+'\n';input.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#message-form').requestSubmit();})()`);
@@ -130,7 +137,40 @@ export async function qualityCheck({ dashboard, mascot, bubble, companion: c, ro
       await c.bridge.call('action', { kind: 'focus', query: target });
       await c.submit('In the verification window only, click the Keyboard verification area and type "Hephaestus verified" using screen_action. Do not change other applications.');
       check('Real model-controlled input reaches the intended field', records.some(r => r.eventName === 'text' && r.text === 'Hephaestus verified'));
+      check('Desktop action passed originating-turn authorization',(c.desktopServer?.metrics?.tools.screen_action??0)>0);
+      await until(()=>(c.desktopServer?.metrics?.imagesConfirmed??0)>0,3000,'No shared tool image received a confirmed MCP delivery receipt');
+      check('Tool images are confirmed after MCP delivery',(c.desktopServer?.metrics?.imagesConfirmed??0)>0);
+      report.desktopBridge={originsAuthorized:c.desktopServer.metrics.originsAuthorized,tools:{...c.desktopServer.metrics.tools},imagesConfirmed:c.desktopServer.metrics.imagesConfirmed,hookTrusted:c.originHook?.trustStatus==='trusted'};
       report.requests.push({ kind: 'desktop action', timings: c.state.lastTimings, firstReplyMs: c.state.lastReplyMs });
+      await c.bridge.call('action',{kind:'focus',query:target});
+      const externalId=randomUUID(),externalStarted=Date.now(),bridgeMetrics=c.desktopServer.metrics;
+      const baseline={originsAuthorized:bridgeMetrics.originsAuthorized,imagesConfirmed:bridgeMetrics.imagesConfirmed,tools:{...bridgeMetrics.tools}};
+      const external=report.externalWorkspace={success:false,dispatch:'direct T3 orchestration API; not companion.submit',creationSource:'web',messageId:externalId,externalBranchObserved:false};
+      let externalBranch=false,externalRun,externalUser,externalReply;
+      const externalState=state=>{if(state.busy&&c.externalT3Run&&c.t3MessageId===externalId){externalBranch=true;external.externalBranchObserved=true;}};
+      const externalDelta=data=>{if(external.firstTextMs===undefined&&c.externalT3Run&&c.t3MessageId===externalId&&data.full?.trim())external.firstTextMs=Date.now()-externalStarted;};
+      c.on('state',externalState);c.on('delta',externalDelta);
+      try{
+        await c.t3.call('orchestration.dispatchCommand',{type:'message.dispatch',createdBy:'user',creationSource:'web',commandId:randomUUID(),
+          threadId:c.t3ThreadId,messageId:externalId,attachments:[],modelSelection:c.modelSelection(),dispatchMode:{type:'start_immediately'},
+          text:`Use only Hephaestus MCP screen_windows exactly once, then Hephaestus MCP screen_observe exactly once for a fresh view of the foreground input verification window (window ID ${target}). Then describe that verification window in one short sentence. Do not click, type, focus, scroll, annotate, change applications, or call any other tools.`});
+        await until(()=>{
+          externalRun=[...c.t3Runs.values()].find(run=>run.userMessageId===externalId);
+          if(externalRun&&['failed','cancelled','interrupted','rolled_back'].includes(externalRun.status))throw new Error('Direct workspace request ended with '+externalRun.status);
+          externalUser=c.messages.find(message=>message.role==='user'&&message.t3MessageId===externalId);
+          externalReply=c.messages.find(message=>message.role==='assistant'&&message.turnId===externalRun?.id&&message.providerItemId&&message.text?.trim());
+          return externalRun?.status==='completed'&&externalUser&&externalReply&&!c.state.busy&&!c.t3InFlight;
+        },90000,'The direct workspace request did not complete with a real transcript');
+        external.completionMs=Date.now()-externalStarted;
+        const canonical=await c.t3.call('orchestration.getThreadProjection',{threadId:c.t3ThreadId});
+        check('Direct T3 workspace requests retain the external conversation branch',externalBranch&&externalUser.source==='workspace'&&canonical.runs.some(run=>run.id===externalRun.id&&run.status==='completed')&&Number.isFinite(external.firstTextMs));
+        await until(()=>bridgeMetrics.imagesConfirmed>baseline.imagesConfirmed,5000,'The workspace MCP observation did not receive a delivery confirmation');
+        external.originTools=Object.fromEntries(['screen_windows','screen_observe'].map(tool=>[tool,(bridgeMetrics.tools[tool]??0)-(baseline.tools[tool]??0)]));
+        external.originsAuthorized=bridgeMetrics.originsAuthorized-baseline.originsAuthorized;
+        external.deliveryConfirmed=bridgeMetrics.imagesConfirmed-baseline.imagesConfirmed;
+        check('Workspace-origin calls retain signed desktop tools and confirmed image delivery',external.originsAuthorized>0&&external.originTools.screen_windows>0&&external.originTools.screen_observe>0&&external.deliveryConfirmed>0);
+        Object.assign(external,{success:true,runId:externalRun.id,externalBranchObserved:externalBranch});
+      }finally{c.off('state',externalState);c.off('delta',externalDelta);}
       await c.configure({ watching: false });
       fixture.kill(); fixture = null;
 

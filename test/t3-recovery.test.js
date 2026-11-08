@@ -25,6 +25,11 @@ function companion() {
 function event(c, payload, type = 'turn-item.updated') {
   c.t3Stream({ kind: 'event', event: { type, payload } });
 }
+async function currentToolLease(c,tool='screen_windows'){
+ const runId=c.t3RunId,providerThreadId='provider-'+runId,attemptId='attempt-'+runId,nativeSessionId='native-session-'+runId,nativeTurnId='native-turn-'+runId;
+ c.t3??={call:async()=>{throw new Error('Unexpected projection fetch');}};c.t3TransportReady=true;c.providerNativeIds.set(providerThreadId,nativeSessionId);c.t3Attempts.set(attemptId,runId);c.providerTurnUpdate({id:'provider-turn-'+runId,providerThreadId,runAttemptId:attemptId,nativeTurnRef:{nativeId:nativeTurnId},status:'running'});
+ return c.authorizeToolOrigin(Object.freeze({nativeSessionId,nativeTurnId,toolUseId:'tool-use-'+runId,nonce:'fixture-nonce-'+runId,tool}));
+}
 
 test('reconnect restores a running request and permits its fresh observations', async () => {
   const c = companion();
@@ -37,7 +42,7 @@ test('reconnect restores a running request and permits its fresh observations', 
   assert.equal(c.t3InFlight, true);
   assert.equal(c.t3RunId, 'run');
   c.bridge = { call: async () => [{ id: 'window' }] };
-  const result = await c.invokeDesktopTool('screen_windows', {});
+  const result = await c.invokeDesktopTool('screen_windows', {},{lease:await currentToolLease(c)});
   assert.equal(result.success, true);
 });
 
@@ -234,6 +239,7 @@ async function promptFixture(run){
   const dir=await mkdtemp(join(tmpdir(),'hephaestus-instructions-'));
   try{await mkdir(join(dir,'context'));await writeFile(join(dir,'context','AGENTS.md'),'Previous instructions.\n');const c=companion();c.dataDir=dir;c.t3ThreadId='old';c.t3ProjectId='project';c.state.prompt='Previous instructions.';await run(c,dir);}finally{await rm(dir,{recursive:true,force:true});}
 }
+async function readyPromptSnapshot(_tag,_payload,onValue){await onValue({kind:'snapshot',projection:{thread:{},runs:[],turnItems:[]}});return()=>{};}
 
 test('instruction save waits for confirmed cancellation before changing files or subscriptions',async()=>promptFixture(async(c,dir)=>{
   let stoppedSubscriptions=0,launches=0;c.stopT3Subscription=()=>stoppedSubscriptions++;
@@ -247,7 +253,7 @@ test('instruction save waits for confirmed cancellation before changing files or
 test('delayed cancellation can be followed by instruction save and another successful request',async()=>promptFixture(async(c,dir)=>{
   let confirmed=false;
   c.interrupt=async()=>{c.state.stopping=!confirmed;c.t3InFlight=!confirmed;return{confirmed};};
-  c.t3={subscribe:()=>()=>{},call:async(tag,p)=>{if(tag==='orchestration.launchThread')return{threadId:'new'};if(p.type==='message.dispatch')queueMicrotask(()=>c.t3Finish?.());return{};}};
+  c.t3={subscribeReady:readyPromptSnapshot,call:async(tag,p)=>{if(tag==='orchestration.launchThread')return{threadId:'new'};if(p.type==='message.dispatch')queueMicrotask(()=>c.t3Finish?.());return{};}};
   await assert.rejects(c.replacePrompt('New instructions.'),/still stopping/);
   confirmed=true;await c.replacePrompt('New instructions.');
   assert.equal(await readFile(join(dir,'context','AGENTS.md'),'utf8'),'New instructions.\n');
@@ -265,14 +271,14 @@ test('a failed replacement launch keeps the existing instructions and subscripti
 
 test('an unsuccessful prompt-file write preserves the active thread and original text',async()=>promptFixture(async(c,dir)=>{
   await mkdir(join(dir,'context','AGENTS.md.tmp'));let archived;
-  c.interrupt=async()=>({confirmed:true});c.t3={call:async(tag,p)=>{if(tag==='orchestration.launchThread')return{threadId:'new'};archived=p.threadId;return{};}};
+  c.interrupt=async()=>({confirmed:true});c.t3={subscribeReady:readyPromptSnapshot,call:async(tag,p)=>{if(tag==='orchestration.launchThread')return{threadId:'new'};archived=p.threadId;return{};}};
   await assert.rejects(c.replacePrompt('New instructions.'));
   assert.equal(await readFile(join(dir,'context','AGENTS.md'),'utf8'),'Previous instructions.\n');
   assert.equal(c.t3ThreadId,'old');assert.equal(archived,'new');
 }));
 
 test('archiving failure does not misreport successfully activated instructions as unsaved',async()=>promptFixture(async(c,dir)=>{
-  c.interrupt=async()=>({confirmed:true});c.t3={subscribe:()=>()=>{},call:async(tag,p)=>{if(tag==='orchestration.launchThread')return{threadId:'new'};if(p.type==='thread.archive')throw new Error('Archive unavailable');return{};}};
+  c.interrupt=async()=>({confirmed:true});c.t3={subscribeReady:readyPromptSnapshot,call:async(tag,p)=>{if(tag==='orchestration.launchThread')return{threadId:'new'};if(p.type==='thread.archive')throw new Error('Archive unavailable');return{};}};
   await c.replacePrompt('New instructions.');
   assert.equal(await readFile(join(dir,'context','AGENTS.md'),'utf8'),'New instructions.\n');assert.equal(c.t3ThreadId,'new');
   assert.equal(c.activities.at(-1).title,'Conversation history');assert.equal(c.activities.at(-1).status,'failed');
@@ -294,7 +300,7 @@ test('disconnect then Stop preserves revocation, replays cancellation and only p
  c.restoreProjection({thread:{},runs:[{...active.runs[0],status:'interrupted'}]});assert.equal(c.t3StopIntent,null);assert.equal(c.state.activity,'Ready');assert.equal(c.state.busy,false);
  event(c,active.runs[0],'run.created');await assert.rejects(c.invokeDesktopTool('screen_windows',{}),/No active/);
  c.bridge={call:async()=>[{id:'allowed-window'}]};let toolAccepted=false;
- c.t3={call:async(_tag,p)=>{event(c,{id:'new-run',userMessageId:p.messageId,status:'running'},'run.created');toolAccepted=(await c.invokeDesktopTool('screen_windows',{})).success;event(c,{id:'new-run',status:'completed'},'run.updated');return{};}};
+ c.t3={call:async(_tag,p)=>{event(c,{id:'new-run',userMessageId:p.messageId,status:'running'},'run.created');toolAccepted=(await c.invokeDesktopTool('screen_windows',{},{lease:await currentToolLease(c)})).success;event(c,{id:'new-run',status:'completed'},'run.updated');return{};}};
  await c.turn('A new request',{onAccepted:()=>accepted++});assert.equal(accepted,2);assert.equal(toolAccepted,true);assert.equal(c.state.busy,false);
 });
 
@@ -316,20 +322,21 @@ test('a pending disconnected Stop is saved and removed only by confirmed termina
  }finally{await rm(dir,{recursive:true,force:true});}
 });
 
-async function connectFixture(run,{stopIntent}={}){
+async function connectFixture(run,{stopIntent,withholdSnapshot=false}={}){
  const dir=await mkdtemp(join(tmpdir(),'hephaestus-readiness-'));
  const originals={connect:Companion.prototype.connect,start:T3Client.prototype.start,call:T3Client.prototype.call,subscribe:T3Client.prototype.subscribe,close:T3Client.prototype.close,workspaceStart:T3Workspace.prototype.start,fetch:globalThis.fetch};
- let entered,release;const controls={baseOptions:[],states:[],subscribed:false,usageCalls:0,stopCalls:0,projection:stopIntent?{thread:{activeRunId:stopIntent.runId},runs:[{id:stopIntent.runId,userMessageId:stopIntent.messageId,status:'running'}]}:{thread:{},runs:[]},entered:new Promise(r=>entered=r),gate:new Promise(r=>release=r),release:()=>release()};
+ let entered,release,subscriptionEntered,c;const controls={baseOptions:[],states:[],subscribed:false,snapshotProcessed:false,unsubscribed:0,usageCalls:0,stopCalls:0,projection:stopIntent?{thread:{activeRunId:stopIntent.runId},runs:[{id:stopIntent.runId,userMessageId:stopIntent.messageId,status:'running'}]}:{thread:{},runs:[]},entered:new Promise(r=>entered=r),gate:new Promise(r=>release=r),subscriptionEntered:new Promise(r=>subscriptionEntered=r),release:()=>release()};
  try{
   await writeFile(join(dir,'t3-runtime.json'),JSON.stringify({adapterVersion:5,projectId:'project',threadId:'thread',...(stopIntent?{stopIntent}:{})}));
   Companion.prototype.connect=async function(options){controls.baseOptions.push(options);this.publish({connection:'connecting',activity:'Connecting to Codex'});if(options?.publishReady!==false)this.publish({connection:'connected',activity:'Ready'});};
-  T3Client.prototype.start=async function(){this.origin='http://127.0.0.1:12345';this.token='test-session';entered();await controls.gate;return this;};
+  T3Client.prototype.start=async function(){this.origin='http://127.0.0.1:12345';this.token='test-session';this.socket={readyState:1,close(){}};entered();await controls.gate;return this;};
   T3Client.prototype.call=async function(tag,p={}){if(tag==='server.getConfig')return{providers:[{instanceId:'codex',status:'ready',auth:{type:'chatgpt'},models:[{slug:'gpt-6-luna',name:'Luna'}]}],settings:{}};if(tag==='orchestration.getThreadProjection')return structuredClone(controls.projection);if(p.type==='thread.stop'){controls.stopCalls++;controls.projection={thread:{},runs:[{id:stopIntent.runId,status:'interrupted'}]};}return{};};
-  T3Client.prototype.subscribe=function(){controls.subscribed=true;return()=>{};};T3Client.prototype.close=async()=>{};T3Workspace.prototype.start=async function(){return this;};
+  T3Client.prototype.subscribe=function(_tag,_payload,onValue,onError){controls.subscribed=true;controls.sendSnapshot=()=>onValue({kind:'snapshot',projection:structuredClone(controls.projection)});controls.failSubscription=onError;subscriptionEntered();if(!withholdSnapshot)queueMicrotask(()=>controls.sendSnapshot());return()=>controls.unsubscribed++;};T3Client.prototype.close=async()=>{};T3Workspace.prototype.start=async function(){return this;};
   globalThis.fetch=async()=>({json:async()=>[{id:'project',workspaceRoot:join(dir,'context')}]});
-  const c=companion();c.dataDir=dir;c.desktopServer={};c.prepareWorkspace=async()=>{};c.updateUsage=async()=>{assert.equal(c.state.connection,'connected');controls.usageCalls++;};c.on('state',state=>controls.states.push({...state,subscribed:controls.subscribed}));
+  c=companion();c.dataDir=dir;c.desktopServer={};c.prepareWorkspace=async()=>{};c.updateUsage=async()=>{assert.equal(c.state.connection,'connected');controls.usageCalls++;};c.on('messagesRestored',()=>{if(controls.subscribed)controls.snapshotProcessed=true;});c.on('state',state=>controls.states.push({...state,subscribed:controls.subscribed,snapshotProcessed:controls.snapshotProcessed}));
   await run(c,controls);
  }finally{
+  if(c){c.closed=true;clearTimeout(c.reconnectTimer);c.reconnectTimer=null;c.stopT3Subscription?.();c.workspace?.close();}controls.release();if(controls.sendSnapshot&&!controls.snapshotProcessed)await controls.sendSnapshot();
   Companion.prototype.connect=originals.connect;T3Client.prototype.start=originals.start;T3Client.prototype.call=originals.call;T3Client.prototype.subscribe=originals.subscribe;T3Client.prototype.close=originals.close;T3Workspace.prototype.start=originals.workspaceStart;globalThis.fetch=originals.fetch;
   await rm(dir,{recursive:true,force:true});
  }
@@ -338,8 +345,14 @@ async function connectFixture(run,{stopIntent}={}){
 test('startup does not announce connected or Ready until T3 and its subscription are reconciled',async()=>connectFixture(async(c,controls)=>{
  c.state.connection='connecting';const starting=c.connect();await controls.entered;
  assert.deepEqual(controls.baseOptions,[{publishReady:false}]);assert.equal(controls.states.some(s=>s.connection==='connected'||s.activity==='Ready'),false);
- controls.release();await starting;const connected=controls.states.filter(s=>s.connection==='connected');assert.equal(connected.length,1);assert.equal(connected[0].subscribed,true);assert.equal(c.state.activity,'Ready');assert.equal(controls.usageCalls,1);
+ controls.release();await starting;const connected=controls.states.filter(s=>s.connection==='connected');assert.equal(connected.length,1);assert.equal(connected[0].subscribed,true);assert.equal(connected[0].snapshotProcessed,true);assert.equal(c.state.activity,'Ready');assert.equal(controls.usageCalls,1);
 }));
+
+test('an open subscription without its initial snapshot cannot make startup Ready',async()=>connectFixture(async(c,controls)=>{
+ c.state.connection='connecting';const starting=c.connect();await controls.entered;controls.release();await controls.subscriptionEntered;await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(c.t3.socket.readyState,1);assert.equal(controls.subscribed,true);assert.equal(controls.snapshotProcessed,false);assert.equal(controls.states.some(state=>state.connection==='connected'||state.activity==='Ready'),false);assert.equal(controls.usageCalls,0);
+ await controls.sendSnapshot();await starting;assert.equal(c.state.connection,'connected');assert.equal(controls.snapshotProcessed,true);assert.equal(controls.usageCalls,1);
+},{withholdSnapshot:true}));
 
 test('startup replays a saved Stop before announcing readiness and cannot resurrect that run',async()=>connectFixture(async(c,controls)=>{
  c.state.connection='connecting';const starting=c.connect();await controls.entered;controls.release();await starting;
@@ -352,6 +365,14 @@ test('subscription faults from a closed socket leave connected state before publ
  c.scheduleReconnect=()=>{};c.t3.socket={readyState:3};const transitions=[];c.on('state',state=>transitions.push({connection:state.connection,socketState:c.t3.socket.readyState}));
  c.t3.emit('fault',new Error('Subscription disconnected'));const generation=c.generation;c.t3.emit('disconnected');
  assert.equal(c.generation,generation);assert.ok(transitions.every(s=>s.connection!=='connected'));assert.equal(c.state.connection,'reconnecting');assert.equal(c.state.error,'Subscription disconnected');
+}));
+
+test('a post-initialization subscription failure revokes desktop actions and reconnects even with an open socket',async()=>connectFixture(async(c,controls)=>{
+ c.state.connection='connecting';const starting=c.connect();await controls.entered;controls.release();await starting;
+ c.beginExternalRun({id:'stream-run',userMessageId:'stream-user',status:'running'});let declined=false;c.confirmation={reject:()=>declined=true};const generation=c.generation;
+ controls.failSubscription(new Error('Stream failed while socket remained open'));
+ assert.equal(c.t3.socket.readyState,1);assert.equal(c.state.connection,'reconnecting');assert.equal(c.desktopActionsRevoked,true);assert.equal(c.confirmation,null);assert.equal(declined,true);assert.ok(c.generation>generation);assert.ok(c.reconnectTimer);assert.match(c.state.error,/stream disconnected/);
+ await assert.rejects(c.invokeDesktopTool('screen_windows',{}),/No active/);assert.equal(controls.unsubscribed,1);
 }));
 
 async function sharedFrameFixture(){
@@ -389,7 +410,7 @@ test('privacy blocking at acknowledgement suppresses image sharing while retaini
 test('recovery without a Stop restores the continuing request after a real disconnect',async()=>{
  const c=companion();c.scheduleReconnect=()=>c.publish({connection:'reconnecting',busy:true});c.t3={call:async(_tag,p)=>{event(c,{id:'run',userMessageId:p.messageId,status:'running'},'run.created');queueMicrotask(()=>c.t3Disconnected());return{};}};
  await c.turn('Continue this request');assert.equal(c.desktopActionsRevoked,true);assert.equal(c.t3InFlight,true);
- c.restoreProjection({thread:{activeRunId:'run'},runs:[{id:'run',userMessageId:c.t3MessageId,status:'running'}]});assert.equal(c.desktopActionsRevoked,false);c.state.connection='connected';c.bridge={call:async()=>[{id:'window'}]};assert.equal((await c.invokeDesktopTool('screen_windows',{})).success,true);
+ c.restoreProjection({thread:{activeRunId:'run'},runs:[{id:'run',userMessageId:c.t3MessageId,status:'running'}]});assert.equal(c.desktopActionsRevoked,false);c.state.connection='connected';c.bridge={call:async()=>[{id:'window'}]};assert.equal((await c.invokeDesktopTool('screen_windows',{},{lease:await currentToolLease(c)})).success,true);
 });
 
 test('an accepted but not-yet-projected message cannot be declared stopped from an empty snapshot',async()=>{

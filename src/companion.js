@@ -67,6 +67,8 @@ export class Companion extends EventEmitter{
  async openThread(){const p=this.threadParams();let r;if(this.savedThread){try{const {dynamicTools,...resume}=p;r=await this.rpc.call('thread/resume',{...resume,threadId:this.savedThread,excludeTurns:true},60000);}catch{}}if(!r){r=await this.rpc.call('thread/start',p,60000);const items=this.messages.filter(m=>['user','assistant'].includes(m.role)).slice(-40).map(m=>({type:'message',role:m.role,content:[{type:m.role==='user'?'input_text':'output_text',text:m.text}]}));if(items.length)await this.rpc.call('thread/inject_items',{threadId:r.thread.id,items});}this.threadId=r.thread.id;this.savedThread=this.threadId;await this.save();}
  async connect({publishReady=true}={}){
   if(this.closed)return;
+  while(this.promptSaveBarrier)await this.promptSaveBarrier;
+  if(this.closed)return;
   this.publish({connection:'connecting',activity:'Connecting to your Codex subscription',error:null});
   await mkdir(join(this.dataDir,'context'),{recursive:true});
   const args=[];
@@ -94,7 +96,7 @@ export class Companion extends EventEmitter{
   this.publish({plan:account.account.planType,models:this.models,...(publishReady?{connection:'connected',activity:'Ready',error:null}:{})});
   if(publishReady)await this.updateUsage();
  }
- async save(){const s={promptVersion:4,promptDefaultHash:defaultPromptHash(this.state.prompt,this.defaultPrompt),defaultsRevision:1,performanceRevision:2,lunaRevision:1,threadId:this.threadId??this.savedThread,messages:this.messages};for(const k of settingsKeys)s[k]=this.state[k];this.saveQueue=(this.saveQueue??Promise.resolve()).catch(()=>{}).then(async()=>{const tmp=join(this.dataDir,'settings.tmp');await writeFile(tmp,JSON.stringify(s,null,2));await rename(tmp,join(this.dataDir,'settings.json'));});return this.saveQueue;}
+ async save(options={}){if(this.promptSaveBarrier&&!Object.hasOwn(options,"settings")){await this.promptSaveBarrier;return this.save(options);}const {settings=this.state,threadId=this.threadId??this.savedThread}=options;const s={promptVersion:4,promptDefaultHash:defaultPromptHash(settings.prompt,this.defaultPrompt),defaultsRevision:1,performanceRevision:2,lunaRevision:1,threadId,messages:this.messages};for(const k of settingsKeys)s[k]=settings[k];this.saveQueue=(this.saveQueue??Promise.resolve()).catch(()=>{}).then(async()=>{const tmp=join(this.dataDir,'settings.tmp');await writeFile(tmp,JSON.stringify(s,null,2));await rename(tmp,join(this.dataDir,'settings.json'));}).catch(error=>{throw Object.assign(new Error('Your settings could not be saved. Check free disk space and that the settings folder is writable.',{cause:error}),{code:error.code});});return this.saveQueue;}
  async updateUsage(){if(this.state.connection!=='connected')return;const r=await this.rpc.call('account/rateLimits/read',{});this.publish({usage:r.rateLimits});}
  clearScreen(){this.frames=[];this.observations.clear();this.modelObservations?.clear();this.lastModelObservationId=null;this.latest=null;this.attention=null;this.attentionPhysical=null;this.lastWatchFingerprint=null;this.emit('frame',null);this.emit('visionFrame',null);this.emit('annotation',{mark:{kind:'clear'}});}
  blockScreen(reason){this.clearScreen();this.publish({screenPrivacyBlocked:true,screenPrivacyReason:reason,screenWindow:null,captureSource:null,lastVisionAt:null});throw new PrivacyBlockedError(reason);}
@@ -145,6 +147,7 @@ export class Companion extends EventEmitter{
  frameContent(f){return [{type:'inputText',text:JSON.stringify(this.metadata(f))},{type:'inputImage',imageUrl:'data:image/jpeg;base64,'+f.image}];}
  observationContext(){const user=this.messages.filter(m=>m.role==='user').at(-1),reply=this.messages.filter(m=>m.role==='assistant'&&m.source!=='noticed').at(-1);return{lastUserMessage:user?{at:user.at,text:user.text.slice(0,1600)}:null,lastAssistantReply:reply?{at:reply.at,text:reply.text.slice(0,1600)}:null};}
  async watch(){
+  if(this.state.instructionsSaving||this.updatingPrompt||this.promptRecoveryBlocked)return;
   const now=Date.now(),context=this.observationContext();
   if(this.watchPending||!this.state.running||!this.state.watching||!this.state.backgroundVision||!this.state.proactive||this.state.noticeSnoozeUntil>now||this.state.busy||this.userRequests||this.transcribing||this.state.dictating||this.state.connection!=='connected'||now-this.lastWatchAt<this.state.backgroundInterval||now-(this.lastNoticeAt??0)<NOTICE_COOLDOWN||!this.latest)return;
   const fp=Buffer.from(this.latest.fingerprint,'base64');if(screenDifference(fp,this.lastWatchFingerprint)<5)return;
@@ -160,6 +163,7 @@ export class Companion extends EventEmitter{
  async submit(text,{source='text',onAccepted}={}){
   text=String(text);if(text.length>MAX_MESSAGE_LENGTH){const error=new RangeError(`Message exceeds the ${MAX_MESSAGE_LENGTH.toLocaleString('en-US')}-character limit (received ${text.length.toLocaleString('en-US')}). Shorten it and try again; nothing was sent.`);error.code='MESSAGE_TOO_LONG';error.limit=MAX_MESSAGE_LENGTH;error.length=text.length;throw error;}if(!text.trim())return;
   const fast=fastCommand(text),request=this.submitSequence=(this.submitSequence??0)+1;
+  if((this.state.instructionsSaving||this.promptRecoveryBlocked)&&!['stop','mute'].includes(fast?.kind))throw new Error('Instructions are still being saved or recovered. Your message has not been sent.');
   if(!fast)this.assertModelAvailable();
   if(fast&&!['stop','mute'].includes(fast.kind)){if(this.state.stopping||this.desktopActionsRevoked&&this.t3InFlight)throw new Error('The previous request has not stopped yet. Focus the Workspace to check its status');if(!this.state.control)throw new Error('App control is turned off');if(!this.state.running||!this.state.watching)throw new Error('Screen sharing is paused; resume it before controlling an app');}
   if(!this.state.running&&!['stop','mute'].includes(fast?.kind))await this.configure({running:true});
@@ -199,6 +203,7 @@ export class Companion extends EventEmitter{
   throw new Error('Open and focus your browser first');
  }
  async turn(text,{background=false,onAccepted}={}){
+  if(this.state.instructionsSaving||this.promptRecoveryBlocked)throw new Error('Instructions are still being saved or recovered. Your message has not been sent.');
   if(this.state.connection!=='connected')throw new Error('Codex is reconnecting. Your input remains available to retry.');if([this.state.usage?.primary,this.state.usage?.secondary].some(w=>w?.usedPercent>=100)){this.publish({backgroundVision:false});throw new Error('Your included Codex allowance is used up. Wait for its reset.');}
   const turnModel=background?'gpt-6-luna':this.state.model,turnEffort=background?'low':this.state.effort;const token=++this.generation;this.background=background;this.actionCount=0;this.lastActionError=null;this.agentItems=new Map();this.turnId=null;this.turnStart=Date.now();this.firstReply=false;this.activeThreadId=this.threadId;
   this.publish({busy:true,background,activity:background?'Refreshing screen context':'Thinking'});if(!background)this.emit('responseStart',{generation:token});
@@ -234,36 +239,38 @@ export class Companion extends EventEmitter{
  async onTool(m,rpc=this.rpc){
   const token=this.generation;
   const activityId='tool-'+(m.params?.callId??m.id),started=Date.now();
-  const reply=(content,frame)=>{if(m.params.tool==='screen_action')this.lastActionError=null;this.activityEvent({id:activityId,kind:'tool',title:m.params.tool,status:'completed',durationMs:Date.now()-started});rpc.reply(m.id,{success:true,contentItems:typeof content==='string'?[{type:'inputText',text:content}]:content});if(frame)this.shareModelObservation(frame,{generation:token});};
+  const shared=frame=>{const commit=()=>this.shareModelObservation(frame,{generation:token});if(rpc.deferSharedFrame)rpc.deferSharedFrame(commit);else commit();};
+  const reply=(content,frame)=>{if(m.params.tool==='screen_action')this.lastActionError=null;this.activityEvent({id:activityId,kind:'tool',title:m.params.tool,status:'completed',durationMs:Date.now()-started});rpc.reply(m.id,{success:true,contentItems:typeof content==='string'?[{type:'inputText',text:content}]:content});if(frame)shared(frame);};
   try{
+   rpc.assertActive?.();
    if(m.method!=='item/tool/call'){rpc.reply(m.id,{decision:'decline'});return;}
    if(m.params.threadId!==(this.activeThreadId??this.threadId)||!this.state.running||!this.state.busy||this.ignoredTurns?.has(m.params.turnId)||m.params.turnId!==this.turnId)throw new Error('This turn is no longer active');
    const tool=m.params.tool,a=typeof m.params.arguments==='string'?JSON.parse(m.params.arguments):m.params.arguments??{};
    this.activityEvent({id:activityId,kind:'tool',title:tool,status:'running',text:a.reason??'',background:this.background});
-   if(tool==='screen_observe'){const f=await this.observe(null,a);if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(f),f);return;}
-   if(tool==='screen_windows'){const windows=await this.bridge.call('windows');if(token!==this.generation)throw new Error('Interrupted');reply(JSON.stringify(windows.filter(w=>!excludedProcess(w,this.state.excludedApps))));return;}
+   if(tool==='screen_observe'){const f=await this.observe(null,a);rpc.assertActive?.();if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(f),f);return;}
+   if(tool==='screen_windows'){const windows=await this.bridge.call('windows');rpc.assertActive?.();if(token!==this.generation)throw new Error('Interrupted');reply(JSON.stringify(windows.filter(w=>!excludedProcess(w,this.state.excludedApps))));return;}
    if(tool==='companion_notice'){
     const text=String(a.text??'').trim().slice(0,1500);if(!text)throw new Error('Enter a notice');
     const notice={...a,text},evaluate=()=>evaluateNotice({notice,context:this.observationContext(),recentNotices:this.messages.filter(m=>m.source==='noticed'),feedback:this.state.noticeFeedback,enabled:!this.background||this.state.proactive,snoozeUntil:this.background?this.state.noticeSnoozeUntil:0,lastNoticeAt:this.background?this.lastNoticeAt:0,observation:this.modelObservation(a.observationId),background:this.background});let result=evaluate();
     if(result.status==='suppressed'){reply(JSON.stringify(result));return;}
-    if(this.background){if(!this.state.watching){reply(JSON.stringify({status:'suppressed',reason:'screen-paused',retry:false}));return;}try{await this.assertScreenAllowed({mode:this.state.captureMode,frame:this.modelObservation(a.observationId)});}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED')throw e;reply(JSON.stringify({status:'suppressed',reason:'screen-private',retry:false}));return;}if(token!==this.generation)throw new Error('Interrupted');result=evaluate();}
+    if(this.background){if(!this.state.watching){reply(JSON.stringify({status:'suppressed',reason:'screen-paused',retry:false}));return;}try{await this.assertScreenAllowed({mode:this.state.captureMode,frame:this.modelObservation(a.observationId)});}catch(e){if(e.code!=='SCREEN_PRIVACY_BLOCKED')throw e;reply(JSON.stringify({status:'suppressed',reason:'screen-private',retry:false}));return;}rpc.assertActive?.();if(token!==this.generation)throw new Error('Interrupted');result=evaluate();}
     if(result.status==='suppressed'){reply(JSON.stringify(result));return;}
     this.lastNoticeAt=Date.now();const message=this.message('assistant',text,{source:'noticed',notice});if(this.state.spokenReplies)this.emit('speak',text);reply(JSON.stringify({...result,id:message.id}));return;
    }
    if(++this.actionCount>20)throw new Error('Tool limit reached for this reply');
    const f=this.observations.get(a.observationId);if(!f||Date.now()-f.capturedAt>15000)throw new Error('Observation expired. Observe again.');
-   await this.assertScreenAllowed({mode:this.state.captureMode,frame:f});if(token!==this.generation||!this.state.watching)throw new Error('Interrupted');
+   await this.assertScreenAllowed({mode:this.state.captureMode,frame:f});rpc.assertActive?.();if(token!==this.generation||!this.state.watching)throw new Error('Interrupted');
    if(tool==='screen_zoom'){
     const p=framePoint(f,a.x,a.y),q=framePoint(f,a.x+a.width,a.y+a.height);if(a.width<16||a.height<16)throw new Error('Zoom region is too small');
-    const fresh=await this.observe({x:p.x,y:p.y,width:q.x-p.x,height:q.y-p.y});if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(fresh),fresh);return;
+    const fresh=await this.observe({x:p.x,y:p.y,width:q.x-p.x,height:q.y-p.y});rpc.assertActive?.();if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(fresh),fresh);return;
    }
    if(tool==='screen_action'){
     if(this.background)throw new Error('Application control requires a user request');if(!this.state.control)throw new Error('App control is turned off');
-    let actionFrame=f;const steps=a.kind==='sequence'?a.steps:[a];if(!Array.isArray(steps)||!steps.length||steps.length>6)throw new Error('Use between one and six actions');for(const step of steps){validateAction(step);if(a.kind==='sequence'&&['focus','browser'].includes(step.kind))throw new Error('A sequence must stay in the observed window');}if(a.needsConfirmation)await this.askConfirmation(a);if(token!==this.generation||!this.state.control)throw new Error('Interrupted');
-    if(a.focusTarget&&!['focus','browser'].includes(a.kind)){const current=await this.assertScreenAllowed({frame:f});if(token!==this.generation||!this.state.control)throw new Error('Interrupted');if(current.id!==f.window.id){await this.bridge.call('action',{kind:'focus',query:f.window.id});const fresh=await this.observe();if(fresh.window.id!==f.window.id||fresh.width!==f.width||fresh.height!==f.height||screenDifference(Buffer.from(fresh.fingerprint,'base64'),Buffer.from(f.fingerprint,'base64'))>8){this.lastActionError='The intended window changed; no input was sent. Use this fresh observation to retry.';this.activityEvent({id:activityId,kind:'tool',title:tool,status:'failed',text:this.lastActionError,durationMs:Date.now()-started});rpc.reply(m.id,{success:false,contentItems:[{type:'inputText',text:this.lastActionError},...this.frameContent(fresh)]});this.shareModelObservation(fresh,{generation:token});return;}actionFrame=fresh;}}
+    let actionFrame=f;const steps=a.kind==='sequence'?a.steps:[a];if(!Array.isArray(steps)||!steps.length||steps.length>6)throw new Error('Use between one and six actions');for(const step of steps){validateAction(step);if(a.kind==='sequence'&&['focus','browser'].includes(step.kind))throw new Error('A sequence must stay in the observed window');}if(a.needsConfirmation)await this.askConfirmation(a);rpc.assertActive?.();if(token!==this.generation||!this.state.control)throw new Error('Interrupted');
+    if(a.focusTarget&&!['focus','browser'].includes(a.kind)){const current=await this.assertScreenAllowed({frame:f});rpc.assertActive?.();if(token!==this.generation||!this.state.control)throw new Error('Interrupted');if(current.id!==f.window.id){await this.bridge.call('action',{kind:'focus',query:f.window.id});const fresh=await this.observe();if(fresh.window.id!==f.window.id||fresh.width!==f.width||fresh.height!==f.height||screenDifference(Buffer.from(fresh.fingerprint,'base64'),Buffer.from(f.fingerprint,'base64'))>8){this.lastActionError='The intended window changed; no input was sent. Use this fresh observation to retry.';this.activityEvent({id:activityId,kind:'tool',title:tool,status:'failed',text:this.lastActionError,durationMs:Date.now()-started});rpc.reply(m.id,{success:false,contentItems:[{type:'inputText',text:this.lastActionError},...this.frameContent(fresh)]});shared(fresh);return;}actionFrame=fresh;}}
     this.publish({activity:a.reason||`Using ${a.kind}`});this.emit('action',{kind:a.kind,reason:a.reason,at:Date.now()});
-    for(const step of steps){await this.assertScreenAllowed({frame:actionFrame});if(token!==this.generation||!this.state.running||!this.state.watching||!this.state.control)throw new Error('Interrupted');if(step.kind==='browser')await this.focusBrowser({guard:()=>{if(token!==this.generation||!this.state.control)throw new Error('Interrupted');}});else{const request={...step,windowId:actionFrame.window.id};if(['click','doubleclick','rightclick','scroll'].includes(step.kind)&&Number.isFinite(step.x))Object.assign(request,coordinates(actionFrame,step.x,step.y));await this.bridge.call('action',request);}}
-    const fresh=await this.observe();if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(fresh),fresh);return;
+    for(const step of steps){await this.assertScreenAllowed({frame:actionFrame});rpc.assertActive?.();if(token!==this.generation||!this.state.running||!this.state.watching||!this.state.control)throw new Error('Interrupted');if(step.kind==='browser')await this.focusBrowser({guard:()=>{rpc.assertActive?.();if(token!==this.generation||!this.state.control)throw new Error('Interrupted');}});else{const request={...step,windowId:actionFrame.window.id};if(['click','doubleclick','rightclick','scroll'].includes(step.kind)&&Number.isFinite(step.x))Object.assign(request,coordinates(actionFrame,step.x,step.y));await this.bridge.call('action',request);}}
+    const fresh=await this.observe();rpc.assertActive?.();if(token!==this.generation)throw new Error('Interrupted');reply(this.frameContent(fresh),fresh);return;
    }
    if(this.background&&!this.state.proactive)throw new Error('Spontaneous highlights are off');
    if(tool==='screen_annotate')this.emit('annotation',{mark:validateAnnotation(a,f),frame:f});
@@ -280,12 +287,13 @@ export class Companion extends EventEmitter{
   if(this.starting){const pending=this.starting;this.starting=null;const cancelled=pending.then(r=>cancel(r?.turn?.id)).catch(()=>{});await Promise.race([cancelled,new Promise(resolve=>setImmediate(resolve))]);}
   await cancel(id);finish?.();if(token===this.generation)this.publish({busy:false,background:false,activity:'Ready'});
  }
- async replacePrompt(prompt){
+ async replacePrompt(prompt,{persist}={}){
   await this.interrupt();const old=this.threadId;
   const result=await this.rpc.call('thread/start',{...this.threadParams(),baseInstructions:prompt},60000);
   const items=this.messages.filter(m=>['user','assistant'].includes(m.role)).slice(-40).map(m=>({type:'message',role:m.role,content:[{type:m.role==='user'?'input_text':'output_text',text:m.text}]}));
   if(items.length)await this.rpc.call('thread/inject_items',{threadId:result.thread.id,items},60000);
-  this.threadId=result.thread.id;this.savedThread=this.threadId;
+  try{await (persist??(options=>this.save({...options,settings:{...this.state,prompt}})))({threadId:result.thread.id});}catch(error){await this.rpc.call('thread/unsubscribe',{threadId:result.thread.id}).catch(()=>{});throw error;}
+  this.threadId=result.thread.id;this.savedThread=this.threadId;this.state.prompt=prompt;
   if(old)this.rpc.call('thread/unsubscribe',{threadId:old}).catch(()=>{});
  }
  async noticeFeedback(id,value){
@@ -295,6 +303,8 @@ export class Companion extends EventEmitter{
   this.state.noticeFeedback=[...this.state.noticeFeedback.filter(f=>f.id!==id),feedback].slice(-150);message.noticeFeedback=value;this.emit('messageUpdated',{...message});this.publish();await this.save();return this.state;
  }
  async configure(p){
+  if(this.state.instructionsSaving&&p.running===false&&Object.keys(p).length===1){this.state.running=false;await this.interrupt();this.publish();return this.state;}
+  if(this.state.instructionsSaving)throw new Error('Instructions are already being saved. Wait before changing settings.');
   if(p.model!==undefined&&this.models&&!this.models.some(m=>m.id===p.model))throw new Error('Choose an available Codex model');
   if(p.inputMode!==undefined&&!['always','wispr'].includes(p.inputMode))throw new Error('Choose always-on or Wispr input');
   if(p.prompt!==undefined&&(typeof p.prompt!=='string'||!p.prompt.trim()||p.prompt.length>32000))throw new Error('Enter a prompt between 1 and 32,000 characters');
@@ -303,14 +313,20 @@ export class Companion extends EventEmitter{
   if(p.captureMode!==undefined&&!['window','monitor'].includes(p.captureMode))throw new Error('Choose window or monitor capture');
   if(p.excludedApps!==undefined)p={...p,excludedApps:excludedApps(p.excludedApps)};
   const replace=p.prompt!==undefined&&p.prompt!==this.state.prompt;
-  if(replace){if(this.state.connection!=='connected')throw new Error('Wait for the connection to recover before saving instructions. Your edits have not been saved.');await this.replacePrompt(p.prompt);}
+  if(replace){
+   if(this.state.connection!=='connected')throw new Error('Wait for the connection to recover before saving instructions. Your edits have not been saved.');
+   const next={...this.state};for(const key of [...settingsKeys,'running'])if(p[key]!==undefined)next[key]=p[key];
+   next.opacity=Math.max(.45,Math.min(1,Number(next.opacity)||1));next.backgroundInterval=Math.max(10000,Math.min(600000,Number(next.backgroundInterval)||20000));
+   let release;this.promptSaveBarrier=new Promise(resolve=>release=resolve);this.publish({instructionsSaving:true});
+   try{await this.replacePrompt(p.prompt,{persist:options=>this.save({settings:next,...options})});}finally{this.promptSaveBarrier=null;this.publish({instructionsSaving:false});release();}
+  }
   if(p.excludedApps!==undefined)this.privacyConfigurationError=null;
   for(const k of [...settingsKeys,'running'])if(p[k]!==undefined)this.state[k]=p[k];
   this.state.opacity=Math.max(.45,Math.min(1,Number(this.state.opacity)||1));this.state.backgroundInterval=Math.max(10000,Math.min(600000,Number(this.state.backgroundInterval)||20000));
   if(p.running===false||p.inputMode==='wispr')this.voiceEpoch=(this.voiceEpoch??0)+1;
   if(p.running===false||p.watching===false||p.control===false||this.background&&(p.backgroundVision===false||p.proactive===false||p.noticeSnoozeUntil>Date.now()))await this.interrupt();
   if(p.running===false||p.watching===false||p.excludedApps!==undefined){this.clearScreen();if(!this.state.watching||!this.state.running)this.publish({screenPrivacyBlocked:false,screenPrivacyReason:null,screenWindow:null,captureSource:null});}
-  if(p.inputMode==='always')await this.startSpeech();this.publish();await this.save();if(this.state.running)await this.sample();return this.state;
+  if(p.inputMode==='always')await this.startSpeech();this.publish();if(!replace)await this.save();if(this.state.running)await this.sample();return this.state;
  }
  async close(){this.closed=true;clearInterval(this.screenTimer);clearInterval(this.visionTimer);clearInterval(this.usageTimer);clearTimeout(this.reconnectTimer);clearTimeout(this.bridgeTimer);clearTimeout(this.speechTimer);await this.interrupt();await this.historyImport;await this.saveQueue;await this.ledger?.flush();this.rpc?.close();this.speech?.close();this.bridge?.close();}
 }

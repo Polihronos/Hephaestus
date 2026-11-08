@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
+import { resolveCodexLauncher } from './codex-launcher.js';
 
 export class CodexRpc extends EventEmitter {
   constructor({ command = 'codex', args = [], cwd = process.cwd() } = {}) {
@@ -15,10 +16,15 @@ export class CodexRpc extends EventEmitter {
   async start() {
     const env={...process.env};
     for(const name of ['OPENAI_API_KEY','CODEX_API_KEY','AZURE_OPENAI_API_KEY','CODEX_SESSION_ID','CODEX_THREAD_ID','CODEX_TOOL_CALL_ID','CODEX_INTERNAL_ORIGINATOR_OVERRIDE','T3CODE_THREAD_ID'])delete env[name];
-    this.process = spawn(this.command, ['app-server', ...this.args], {
-      cwd: this.cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+    const launcher=await resolveCodexLauncher(this.command,{cwd:this.cwd,env});
+    if(launcher.runAsNode)env.ELECTRON_RUN_AS_NODE='1';
+    this.process = spawn(launcher.command, [...launcher.args, 'app-server', ...this.args], {
+      cwd: this.cwd, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'],
     });
-    this.process.on('error', error => this.emit('fault', error));
+    this.process.on('error', error => {
+      for(const p of this.pending.values()){clearTimeout(p.timer);p.reject(error);}
+      this.pending.clear();this.emit('fault', error);
+    });
     this.process.stdin.on('error', error => this.emit('fault', error));
     this.process.stderr.on('data', data => this.emit('diagnostic', data.toString()));
     this.lines = createInterface({ input: this.process.stdout });

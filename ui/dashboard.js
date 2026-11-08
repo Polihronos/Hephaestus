@@ -77,11 +77,11 @@ function activity(text, at = Date.now()) {
 function updateComposer() {
   const pending = localPending || state.sendPending === true;
   const localCommand = !!fastCommand($('dashboard-input').value);
-  $('send').disabled = pending || (state.connection !== 'connected' && !localCommand) || !$('dashboard-input').value.trim();
+  $('send').disabled = pending || state.instructionsSaving === true || (state.connection !== 'connected' && !localCommand) || !$('dashboard-input').value.trim();
   $('send').textContent = pending ? '…' : '↑';
   $('send').setAttribute('aria-label',pending ? 'Sending message' : 'Send message');
   $('message-form').setAttribute('aria-busy',String(pending));
-  $('compose-hint').textContent = pending ? 'Sending your message…' : state.connection !== 'connected' ? localCommand ? 'Local command · Enter to send' : 'Reconnecting · your draft stays here' : 'Enter to send · Shift + Enter for a new line';
+  $('compose-hint').textContent = state.instructionsSaving ? 'Saving instructions · your draft stays here' : pending ? 'Sending your message…' : state.connection !== 'connected' ? localCommand ? 'Local command · Enter to send' : 'Reconnecting · your draft stays here' : 'Enter to send · Shift + Enter for a new line';
   $('stop').disabled = state.stopping === true || !(state.busy === true || state.speaking === true || pending);
   $('stop').textContent = state.stopping === true ? 'Stopping…' : '■ Stop reply';
 }
@@ -268,7 +268,7 @@ $('notice-retry').onclick = async () => { const retry = retryNotice; if (!retry)
 $('prompt').oninput = () => { dirty = true; $('prompt-status').textContent = 'Unsaved changes'; $('prompt-count').textContent = `${$('prompt').value.length.toLocaleString()} / 32,000`; };
 $('save-prompt').onclick = async () => {
   const submitted=$('prompt').value;$('save-prompt').disabled=true;$('save-prompt').textContent='Saving…';
-  try{await request('configure',{prompt:submitted});dirty=$('prompt').value!==submitted;$('prompt-status').textContent=dirty?'Earlier version saved · new changes are unsaved':'Saved · active now';hideNotice();}
+  try{await request('configure',{prompt:submitted});dirty=$('prompt').value!==submitted;$('prompt-status').textContent=dirty?'Earlier version saved · new changes are unsaved':'Instructions saved';hideNotice();}
   catch(error){notice(error,{retry:()=>$('save-prompt').click()});}
   finally{$('save-prompt').disabled=false;$('save-prompt').textContent='Save instructions';}
 };

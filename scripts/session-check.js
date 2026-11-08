@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { signToolOrigin, TOOL_ORIGIN_FIELD } from '../src/tool-origin.js';
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'rolled_back']);
 const cancelled = new Set(['cancelled', 'interrupted', 'rolled_back']);
@@ -12,7 +13,7 @@ const safeError = error => String(error?.message ?? error)
   .slice(0, 1200);
 
 // Uses the production windows and a real T3 session. The only injected faults are
-// a missing local transcript entry and a clearly labelled, action-free approval.
+// a missing local entry, an action-free approval, and a signed obsolete origin.
 // No microphone, desktop capture, fabricated reply, or daemon restart is involved.
 export async function sessionCheck({ dashboard, mascot, bubble, companion: c, root, showDashboard, app }) {
   const out = join(root, 'artifacts', 'session-check');
@@ -140,6 +141,13 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
   function finalFor(runId) {
     return c.messages.filter(message => message.role === 'assistant' && message.turnId === runId && message.providerItemId).at(-1);
   }
+  function nativeOriginForRun(canonical,runId) {
+    const attempts=new Set((canonical.attempts??[]).filter(attempt=>attempt.runId===runId).map(attempt=>attempt.id));
+    const turn=[...(canonical.providerTurns??[])].reverse().find(turn=>attempts.has(turn.runAttemptId)&&turn.status==='completed'&&turn.nativeTurnRef?.nativeId);
+    const thread=(canonical.providerThreads??[]).find(thread=>thread.id===turn?.providerThreadId);
+    assert.ok(turn?.nativeTurnRef?.nativeId&&thread?.nativeThreadRef?.nativeId,'The completed real request did not expose its native originating turn');
+    return Object.freeze({nativeSessionId:thread.nativeThreadRef.nativeId,nativeTurnId:turn.nativeTurnRef.nativeId});
+  }
   async function sendFromUI(text, id, { onAccepted, onRun } = {}) {
     assertPrivate();
     await until(() => c.state.connection === 'connected' && !c.state.busy && !c.t3InFlight && !c.state.sendPending,
@@ -244,6 +252,7 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     const firstToken = marker + '-FIRST';
     const first = await sendFromUI(`This is an isolated text-only application session verification. Please do not call tools, read files, inspect the desktop, or change any settings. Produce exactly an eight-item numbered list, with each item containing the token ${firstToken} followed by that item's number. Use one item per line, no preamble, no conclusion, and no extra explanation. The separate lines let the application verify its conversation reading position using a real response.`, 'initial-send');
     const firstResult = await completed(first, firstToken);
+    const firstNativeOrigin = nativeOriginForRun(firstResult.canonical,first.runId);
     await snapshot('01-real-reply.png');
 
     phase = 'missing-reply-restoration';
@@ -309,6 +318,53 @@ export async function sessionCheck({ dashboard, mascot, bubble, companion: c, ro
     const reconnectToken = marker + '-RECONNECT';
     const active = await sendFromUI(`Text-only session recovery verification. Do not call any tools. Start with ${reconnectToken}. Then produce 60 numbered practical tips for keeping a desktop workspace organized, at most eight words per item. Use a separate paragraph for each item so the application can observe a real stream while reconnecting.`, 'active-send');
     const activeProjection = await projection(), activeRemote = activeProjection.runs?.find(run => run.id === active.runId);
+    const staleOriginFault={kind:'fault-injection-real-transport',oldRunId:first.runId,
+      oldRunStatus:firstResult.canonical.runs?.find(run=>run.id===first.runId)?.status,currentRunId:active.runId,currentRunStatus:activeRemote?.status??null,
+      description:'An explicitly constructed signed payload uses the completed first request native IDs. This is not a provider hook or human call.'};
+    report.faultInjections.push(staleOriginFault);
+    const currentActive=()=>c.state.connection==='connected'&&c.state.busy&&c.t3InFlight&&c.t3RunId===active.runId&&!terminal.has(c.t3Runs.get(active.runId)?.status);
+    if(activeRemote&&!terminal.has(activeRemote.status)&&currentActive()){
+      assert.ok(allowCleanup&&samePath(await realpath(c.dataDir)),'The stale-origin transport check requires the validated isolated profile');
+      const bridgePath=join(c.dataDir,'desktop-bridge.json');
+      assert.equal(resolve(await realpath(bridgePath)).toLowerCase(),resolve(expectedReal,'desktop-bridge.json').toLowerCase(),'Only the isolated desktop bridge configuration may be read');
+      const bridge=JSON.parse(await readFile(bridgePath,'utf8'));
+      assert.ok(/^http:\/\/127\.0\.0\.1:\d+\/tool$/.test(bridge.url)&&typeof bridge.token==='string'&&typeof bridge.originSecret==='string','The isolated desktop bridge configuration is invalid');
+      const proof=signToolOrigin({secret:bridge.originSecret,tool:'screen_windows',args:{},...firstNativeOrigin,toolUseId:'verification-stale-'+marker});
+      const payload=Object.freeze({name:'screen_windows',arguments:Object.freeze({[TOOL_ORIGIN_FIELD]:proof})});
+      const serialized=JSON.stringify(payload),metrics=c.desktopServer?.metrics;
+      assert.ok(metrics&&Number.isFinite(metrics.originsAuthorized)&&metrics.tools,'The actual desktop bridge metrics are unavailable');
+      const before={originsAuthorized:metrics.originsAuthorized,tools:{...metrics.tools}},generation=c.generation;
+      if(currentActive()){
+        const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),remaining(5000));
+        let response;
+        try{
+          response=await fetch(bridge.url,{method:'POST',headers:{Authorization:'Bearer '+bridge.token,'Content-Type':'application/json'},
+            body:serialized,signal:controller.signal,redirect:'error'});
+          await response.arrayBuffer();
+        }finally{clearTimeout(timer);}
+        const afterFault=await projection(),afterRun=afterFault.runs?.find(run=>run.id===active.runId);
+        staleOriginFault.currentRunStatus=afterRun?.status??null;staleOriginFault.httpStatus=response.status;
+        const unchanged=metrics.originsAuthorized===before.originsAuthorized&&JSON.stringify(metrics.tools)===JSON.stringify(before.tools);
+        assert.equal(response.status,400,'The actual desktop bridge did not reject the completed-run tool origin');
+        assert.ok(unchanged,'The stale-origin fault unexpectedly authorized or invoked a desktop tool');
+        if(afterRun&&!terminal.has(afterRun.status)&&currentActive()&&c.generation===generation){
+          check('stale-origin-http-rejected','A signed completed-run call cannot borrow the newer active request authority',response.status===400&&unchanged,
+            'fault-injection-real-transport',{oldRunId:first.runId,oldRunStatus:staleOriginFault.oldRunStatus,currentRunId:active.runId,currentRunStatus:afterRun.status,httpStatus:response.status,noInvoke:unchanged});
+          staleOriginFault.outcome='rejected-during-new-active-run';
+        }else{
+          staleOriginFault.outcome='not-exercised';staleOriginFault.reason='The newer real request completed before active-run rejection could be confirmed.';
+        }
+      }else{
+        staleOriginFault.outcome='not-exercised';staleOriginFault.reason='The newer real request completed before the stale-origin payload could be sent.';
+      }
+    }else{
+      staleOriginFault.outcome='not-exercised';staleOriginFault.reason='The newer real request was no longer active when the stale-origin check began.';
+    }
+    if(staleOriginFault.outcome==='not-exercised'){
+      report.checks.push({id:'stale-origin-http-rejected',name:'Reject a completed-run HTTP tool call while a newer request is active',status:'not-exercised',
+        kind:'fault-injection-real-transport',reason:staleOriginFault.reason,evidence:{oldRunId:first.runId,oldRunStatus:staleOriginFault.oldRunStatus,currentRunId:active.runId,currentRunStatus:staleOriginFault.currentRunStatus}});
+      report.limitations.push('Stale-origin real-HTTP rejection was not exercised while a newer request remained active; no negative pass is claimed.');
+    }
     assert.ok(activeRemote && !terminal.has(activeRemote.status), 'The request finished before its active connection could be tested');
     const transitionStart = report.stateTransitions.length;
     const activeReconnect = await disconnectClient('active-reconnect');
