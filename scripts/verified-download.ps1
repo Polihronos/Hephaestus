@@ -31,11 +31,24 @@ function Remove-WorkspaceGeneratedItem {
     if (Test-Path -LiteralPath $taskSafePath) { Remove-Item -LiteralPath $taskSafePath -Force -Recurse:$Recurse -ErrorAction Stop }
 }
 
+function Get-DownloadSha256 {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+    $taskHasher = [Security.Cryptography.SHA256]::Create()
+    $taskStream = $null
+    try {
+        $taskStream = [IO.File]::OpenRead($LiteralPath)
+        return [BitConverter]::ToString($taskHasher.ComputeHash($taskStream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        if ($taskStream) { $taskStream.Dispose() }
+        $taskHasher.Dispose()
+    }
+}
+
 function Test-VerifiedDownloadFile {
     param([string]$Path, [string]$Sha256, [scriptblock]$Validate)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     try {
-        if ($Sha256 -and (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ine $Sha256) { return $false }
+        if ($Sha256 -and (Get-DownloadSha256 -LiteralPath $Path) -ine $Sha256) { return $false }
         if ($Validate) {
             $taskValidation = @(& $Validate $Path)
             if ($taskValidation.Count -ne 1 -or $taskValidation[0] -isnot [bool] -or -not $taskValidation[0]) { return $false }

@@ -2,24 +2,31 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {mkdtemp,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 
 const execFileAsync=promisify(execFile),windows={skip:process.platform!=='win32'};
-async function fixture(body){
+async function fixture(body,{withoutFileHash=false}={}){
  const root=await mkdtemp(join(tmpdir(),'hephaestus-downloads-'));
  try{
-  const script=join(root,'fixture.ps1');
-  await writeFile(script,`param([string]$Helper,[string]$FixtureRoot,[string]$SourceRoot)\n$ErrorActionPreference='Stop'\n. $Helper\nfunction Assert-Task { param($Condition,[string]$Message) if(-not $Condition){throw $Message} }\nfunction Write-TaskFile { param([string]$Path,[string]$Text) [void][IO.Directory]::CreateDirectory((Split-Path -Parent $Path)); [IO.File]::WriteAllText($Path,$Text,(New-Object Text.UTF8Encoding($false))) }\n${body}\nWrite-Output 'LOCAL_DOWNLOAD_FIXTURE_PASSED'\n`);
-  const result=await execFileAsync('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',script,'-Helper',resolve('scripts/verified-download.ps1'),'-FixtureRoot',root,'-SourceRoot',process.cwd()],{timeout:20000,windowsHide:true,maxBuffer:1024*1024});
+  const script=join(root,'fixture.ps1'),hasher=join(root,'expected-sha256.mjs'),env={...process.env};
+  await writeFile(hasher,`import {createHash} from 'node:crypto';import {createReadStream} from 'node:fs';const hash=createHash('sha256');for await(const bytes of createReadStream(process.argv[2]))hash.update(bytes);process.stdout.write(hash.digest('hex'));`);
+  if(withoutFileHash){
+   // Reproduce a newer parent's inherited module path masking Windows PowerShell's Utility functions.
+   const moduleRoot=join(root,'modules'),utility=join(moduleRoot,'Microsoft.PowerShell.Utility','7.5.0');await mkdir(utility,{recursive:true});
+   await writeFile(join(utility,'Microsoft.PowerShell.Utility.psd1'),`@{RootModule='Utility.psm1';ModuleVersion='7.5.0';PowerShellVersion='7.0';FunctionsToExport=@('Get-FileHash');CmdletsToExport=@();AliasesToExport=@()}\n`);
+   await writeFile(join(utility,'Utility.psm1'),`function Get-FileHash { throw 'This newer Utility module cannot load in Windows PowerShell' }\n`);env.PSModulePath=moduleRoot;
+  }
+  await writeFile(script,`param([string]$Helper,[string]$FixtureRoot,[string]$SourceRoot,[string]$TaskNode,[string]$TaskHasher)\n$ErrorActionPreference='Stop'\n. $Helper\nfunction Assert-Task { param($Condition,[string]$Message) if(-not $Condition){throw $Message} }\nfunction Write-TaskFile { param([string]$Path,[string]$Text) [void][IO.Directory]::CreateDirectory((Split-Path -Parent $Path)); [IO.File]::WriteAllText($Path,$Text,(New-Object Text.UTF8Encoding($false))) }\nfunction Get-TaskExpectedHash { param([string]$Path) $taskExpected=& $TaskNode $TaskHasher $Path; if($LASTEXITCODE -ne 0){throw 'The independent Node checksum fixture failed'}; return $taskExpected }\n${body}\nWrite-Output 'LOCAL_DOWNLOAD_FIXTURE_PASSED'\n`);
+  const result=await execFileAsync('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',script,'-Helper',resolve('scripts/verified-download.ps1'),'-FixtureRoot',root,'-SourceRoot',process.cwd(),'-TaskNode',process.execPath,'-TaskHasher',hasher],{timeout:20000,windowsHide:true,maxBuffer:1024*1024,env});
   assert.match(result.stdout,/LOCAL_DOWNLOAD_FIXTURE_PASSED/);
  }finally{await rm(root,{recursive:true,force:true});}
 }
 
 test('verified downloads recover corrupt caches, reject bad transfers and reuse only checked data',windows,()=>fixture(`
 $taskSource=Join-Path $FixtureRoot 'source.bin'; Write-TaskFile $taskSource 'verified payload'
-$taskHash=(Get-FileHash -LiteralPath $taskSource -Algorithm SHA256).Hash
+$taskHash=Get-TaskExpectedHash $taskSource
 $taskDestination=Join-Path $FixtureRoot 'cache[1].bin'; Write-TaskFile $taskDestination 'corrupt cache'
 $script:TaskTransfers=0
 $taskTransfer={param($Uri,$OutFile) $script:TaskTransfers++; if($script:TaskTransfers -eq 1){Write-TaskFile $OutFile 'bad response'}else{[IO.File]::Copy($taskSource,$OutFile)}}
@@ -32,7 +39,7 @@ Assert-Task (@(Get-ChildItem -LiteralPath $FixtureRoot -Filter '*.download').Cou
 
 test('interrupted transfers never promote partial bytes and a later retry needs no cleanup',windows,()=>fixture(`
 $taskSource=Join-Path $FixtureRoot 'source.bin'; Write-TaskFile $taskSource 'complete payload'
-$taskHash=(Get-FileHash -LiteralPath $taskSource -Algorithm SHA256).Hash
+$taskHash=Get-TaskExpectedHash $taskSource
 $taskDestination=Join-Path $FixtureRoot 'downloaded.bin'; $script:TaskTransfers=0; $taskFailed=$false
 try { Get-VerifiedDownload -WorkspaceRoot $FixtureRoot -Destination $taskDestination -Uri 'https://unused.invalid/file' -Sha256 $taskHash -Transfer {param($Uri,$OutFile) $script:TaskTransfers++; Write-TaskFile $OutFile 'partial'; throw 'Transfer interrupted'} | Out-Null }catch{$taskFailed=$true}
 Assert-Task $taskFailed 'Interrupted transfer unexpectedly succeeded'
@@ -80,7 +87,7 @@ Copy-Item -LiteralPath (Join-Path $SourceRoot 'scripts\\verified-download.ps1') 
 Copy-Item -LiteralPath (Join-Path $SourceRoot 'scripts\\fetch-runtime.ps1') -Destination $taskScripts
 $taskArchiveContents=Join-Path $FixtureRoot 'archive-content'; Write-TaskFile (Join-Path $taskArchiveContents 'electron.exe') 'verified executable fixture'
 $global:TaskFixtureArchive=Join-Path $FixtureRoot 'runtime-fixture.zip'; Compress-Archive -LiteralPath (Join-Path $taskArchiveContents 'electron.exe') -DestinationPath $global:TaskFixtureArchive
-$taskHash=(Get-FileHash -LiteralPath $global:TaskFixtureArchive -Algorithm SHA256).Hash
+$taskHash=Get-TaskExpectedHash $global:TaskFixtureArchive
 Write-TaskFile (Join-Path $taskProject 'node_modules\\electron\\package.json') ('{^version^:^1.2.3^}'.Replace('^',[char]34))
 Write-TaskFile (Join-Path $taskProject 'node_modules\\electron\\checksums.json') (('{^electron-v1.2.3-win32-x64.zip^:^'+$taskHash+'^}').Replace('^',[char]34))
 Write-TaskFile (Join-Path $taskProject '.runtime-downloads\\electron.zip') 'corrupt archive cache'
@@ -132,3 +139,23 @@ foreach($taskName in @('config.json','tokenizer.json','vocabulary.txt')){Assert-
 Assert-Task (-not (Test-Path -LiteralPath (Join-Path $taskModel 'model.bin'))) 'Partial model weights were promoted'
 Assert-Task (@(Get-ChildItem -LiteralPath $taskModel -Filter '*.download').Count -eq 0) 'Interrupted model temporary files remained'
 `));
+
+test('SHA-256 enforcement survives an inherited newer module that hides Get-FileHash',windows,()=>fixture(`
+Assert-Task (-not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) 'The inherited-module failure was not reproduced'
+$taskSource=Join-Path $FixtureRoot 'abc[1].bin'; Write-TaskFile $taskSource 'abc'
+$taskExpected=Get-TaskExpectedHash $taskSource
+Assert-Task ($taskExpected -ceq 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') 'The independent SHA-256 known vector changed'
+Assert-Task ((Get-DownloadSha256 -LiteralPath $taskSource) -ceq $taskExpected) 'Streamed checksum differs from the independent known vector'
+Assert-Task (Test-VerifiedDownloadFile -Path $taskSource -Sha256 $taskExpected) 'A valid checksum was rejected without Get-FileHash'
+Assert-Task (-not (Test-VerifiedDownloadFile -Path $taskSource -Sha256 ('0'*64))) 'A wrong checksum was accepted without Get-FileHash'
+$taskBinary=Join-Path $FixtureRoot 'binary.bin'; [IO.File]::WriteAllBytes($taskBinary,[byte[]](0,1,255,128,0,13,10,42))
+Assert-Task ((Get-DownloadSha256 -LiteralPath $taskBinary) -ceq (Get-TaskExpectedHash $taskBinary)) 'Binary bytes were not hashed correctly'
+$taskDestination=Join-Path $FixtureRoot 'recovered.bin'; Write-TaskFile $taskDestination 'corrupt cache'; $script:TaskTransfers=0
+Get-VerifiedDownload -WorkspaceRoot $FixtureRoot -Destination $taskDestination -Uri 'https://unused.invalid/file' -Sha256 $taskExpected -Transfer {param($Uri,$OutFile) $script:TaskTransfers++; [IO.File]::Copy($taskSource,$OutFile)} | Out-Null
+Assert-Task ($script:TaskTransfers -eq 1) 'Corrupt cache was not repaired under the inherited module failure'
+Get-VerifiedDownload -WorkspaceRoot $FixtureRoot -Destination $taskDestination -Uri 'https://unused.invalid/file' -Sha256 $taskExpected.ToUpperInvariant() -Transfer {throw 'Verified cache must not redownload'} | Out-Null
+Assert-Task ([IO.File]::ReadAllText($taskDestination) -eq 'abc') 'Corrupt cache bytes were promoted'
+Remove-WorkspaceGeneratedItem -WorkspaceRoot $FixtureRoot -Path $taskSource
+Remove-WorkspaceGeneratedItem -WorkspaceRoot $FixtureRoot -Path $taskBinary
+Assert-Task (-not (Test-Path -LiteralPath $taskSource)) 'Checksum streaming left a file handle open'
+`,{withoutFileHash:true}));
